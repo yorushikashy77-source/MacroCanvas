@@ -15,6 +15,12 @@ CONFIG_BACKUP_LIMIT = 10
 LEGACY_CONFIG_PATH = APP_DIR / "mappings.json"
 KANATA_SETTINGS_PATH = APP_DIR / "components.json"
 
+# Official upstream pages for the runtime components used by MacroCanvas.
+KANATA_GITHUB_URL = "https://github.com/jtroo/kanata"
+KANATA_RELEASES_URL = "https://github.com/jtroo/kanata/releases"
+INTERCEPTION_GITHUB_URL = "https://github.com/oblitum/Interception"
+INTERCEPTION_RELEASES_URL = "https://github.com/oblitum/Interception/releases"
+
 
 def kanata_dir():
     """Return the configured/portable Kanata component directory.
@@ -121,6 +127,5 @@ class MacroState(Enum):
     RECORDING = "录制中"
     STOPPING = "正在停止"
     STOP_TIMEOUT = "停止超时"
-
 
 

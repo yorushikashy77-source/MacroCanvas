@@ -50,6 +50,11 @@ python main.py
 
 普通模式至少需要对应的 Kanata 可执行文件和配置运行时。游戏模式还需要 `interception.dll` 以及已安装的 Interception 驱动。组件文件应从对应项目的官方发布渠道获取，不要把未经确认的 DLL 或驱动提交到仓库。
 
+官方地址也可以从程序菜单 `设置 → 官方组件下载` 直接打开：
+
+- [Kanata 源码仓库](https://github.com/jtroo/kanata) · [Kanata Releases](https://github.com/jtroo/kanata/releases)
+- [Interception 源码仓库](https://github.com/oblitum/Interception) · [Interception Releases](https://github.com/oblitum/Interception/releases)
+
 ## 配置和数据位置
 
 用户数据默认保存在：

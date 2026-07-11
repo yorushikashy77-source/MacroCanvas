@@ -33,8 +33,10 @@ except ImportError:
 from ctypes import wintypes
 from enum import Enum
 
-from PySide6.QtCore import QEvent, QSize, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QCursor, QFont, QPainter, QPen
+from PySide6.QtCore import QEvent, QSize, QTimer, Qt, Signal, Slot, QUrl
+from PySide6.QtGui import (
+    QColor, QCursor, QDesktopServices, QFont, QPainter, QPen,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox,
     QComboBox, QFrame, QHBoxLayout, QHeaderView,
@@ -568,6 +570,33 @@ class MainWindow(
             self.choose_kanata_directory
         )
         settings_menu.addSeparator()
+        official_components_menu = settings_menu.addMenu("官方组件下载")
+        self.kanata_releases_action = official_components_menu.addAction(
+            "下载 Kanata（GitHub Releases）"
+        )
+        self.kanata_releases_action.triggered.connect(
+            lambda: self.open_external_url(KANATA_RELEASES_URL)
+        )
+        self.interception_releases_action = official_components_menu.addAction(
+            "下载 Interception（GitHub Releases）"
+        )
+        self.interception_releases_action.triggered.connect(
+            lambda: self.open_external_url(INTERCEPTION_RELEASES_URL)
+        )
+        official_components_menu.addSeparator()
+        self.kanata_source_action = official_components_menu.addAction(
+            "查看 Kanata 源码仓库"
+        )
+        self.kanata_source_action.triggered.connect(
+            lambda: self.open_external_url(KANATA_GITHUB_URL)
+        )
+        self.interception_source_action = official_components_menu.addAction(
+            "查看 Interception 源码仓库"
+        )
+        self.interception_source_action.triggered.connect(
+            lambda: self.open_external_url(INTERCEPTION_GITHUB_URL)
+        )
+        settings_menu.addSeparator()
         self.diagnostic_action = settings_menu.addAction("本地诊断日志")
         self.diagnostic_action.setCheckable(True)
         self.diagnostic_action.toggled.connect(
@@ -590,6 +619,17 @@ class MainWindow(
         )
         self.update_global_hotkey_action_text()
         self.update_diagnostic_action_text()
+
+    def open_external_url(self, url):
+        """Open an official component page in the user's default browser."""
+        if QDesktopServices.openUrl(QUrl(str(url))):
+            return True
+        QMessageBox.warning(
+            self,
+            "无法打开网页",
+            f"无法调用系统浏览器打开以下地址：\n{url}",
+        )
+        return False
 
 
 
