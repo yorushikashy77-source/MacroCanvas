@@ -1,0 +1,34 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Test, lint, and coverage output
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+*.exe
+*.dll
+
+# Local MacroCanvas runtime data
+config.json
+components.json
+config_backups/
+diagnostic.log
+kanata*.log
+*.lock
+*.kbd
+kanata/
+
+# Archived local copies
+旧版备份/
