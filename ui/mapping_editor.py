@@ -205,7 +205,10 @@ class MappingEditorMixin:
             max(0, self.mapping_layout.count() - 1), card
         )
 
-        changed = lambda *_args: self.data_changed()
+        def changed(*_args):
+            if hasattr(self, "refresh_mapping_filters"):
+                self.refresh_mapping_filters()
+            self.data_changed()
         card.enabled.stateChanged.connect(changed)
         card.name.textChanged.connect(changed)
         card.source_hotkey.changed.connect(changed)
@@ -226,6 +229,11 @@ class MappingEditorMixin:
 
         self.refresh_mapping_parameter_panel(card)
         self.refresh_mapping_priority_labels()
+        if (
+            not getattr(self, "initializing", False)
+            and hasattr(self, "refresh_mapping_filters")
+        ):
+            self.refresh_mapping_filters()
         self._loading_checkpoint()
         self.data_changed()
 
@@ -548,6 +556,8 @@ class MappingEditorMixin:
         card.hide()
         card.deleteLater()
         self.data_changed()
+        if hasattr(self, "refresh_mapping_filters"):
+            self.refresh_mapping_filters()
 
     @staticmethod
     def update_mapping_mode_fields(*_args):

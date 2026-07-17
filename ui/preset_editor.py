@@ -112,6 +112,15 @@ class PresetEditorMixin:
         )
         header.addWidget(test)
 
+        preview = QPushButton("◇ 模拟")
+        preview.setObjectName("secondary")
+        preview.setFixedWidth(88)
+        preview.setToolTip("只估算动作时间线，不发送任何键盘或鼠标输入")
+        preview.clicked.connect(
+            lambda _checked=False, c=card: self.preview_selected_preset_simulation(c)
+        )
+        header.addWidget(preview)
+
         record = QPushButton("● 录制动作")
         record.setObjectName("recordAction")
         record.setFixedWidth(104)
@@ -417,6 +426,11 @@ class PresetEditorMixin:
         self.update_card_action_summary(card)
         self.update_preset_action_dialog_title(card)
         self.select_preset_card(card)
+        if (
+            not getattr(self, "initializing", False)
+            and hasattr(self, "refresh_preset_filters")
+        ):
+            self.refresh_preset_filters()
         self._loading_checkpoint(force=True)
         self.data_changed()
 
@@ -537,6 +551,8 @@ class PresetEditorMixin:
     def preset_card_changed(self, card):
         self.select_preset_card(card)
         self.update_preset_action_dialog_title(card)
+        if hasattr(self, "refresh_preset_filters"):
+            self.refresh_preset_filters()
         self.data_changed()
 
     def select_preset_card(self, card):
@@ -718,6 +734,8 @@ class PresetEditorMixin:
             self.action_title = None
 
         self.data_changed()
+        if hasattr(self, "refresh_preset_filters"):
+            self.refresh_preset_filters()
         self.engine_hint.setStyleSheet("")
         self.engine_hint.setText(
             f"已删除“{preset_name}”；运行触发已暂停，应用更改后写入配置"

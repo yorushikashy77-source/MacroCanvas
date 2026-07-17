@@ -14,6 +14,7 @@ CONFIG_BACKUP_DIR = APP_DIR / "config_backups"
 CONFIG_BACKUP_LIMIT = 10
 LEGACY_CONFIG_PATH = APP_DIR / "mappings.json"
 KANATA_SETTINGS_PATH = APP_DIR / "components.json"
+UI_SETTINGS_PATH = APP_DIR / "ui-settings.json"
 
 # Official upstream pages for the runtime components used by MacroCanvas.
 KANATA_GITHUB_URL = "https://github.com/jtroo/kanata"
@@ -127,5 +128,4 @@ class MacroState(Enum):
     RECORDING = "录制中"
     STOPPING = "正在停止"
     STOP_TIMEOUT = "停止超时"
-
 

@@ -387,6 +387,9 @@ class RecordingWorkflowMixin:
         self.begin_recording_countdown(countdown.value())
 
     def begin_recording_countdown(self, seconds):
+        cancel_countdown = getattr(self, "_cancel_manual_test_countdown", None)
+        if callable(cancel_countdown):
+            cancel_countdown("已开始录制，原测试倒计时已取消")
         self.recording_guard_profile_id = str(self.editor_profile_id or "")
         # 游戏模式直接复用 Interception 输入源录制；普通模式才需要
         # Windows 低级钩子观察键鼠事件。

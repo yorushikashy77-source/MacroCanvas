@@ -107,6 +107,8 @@ from ui.editor_workflow import EditorWorkflowMixin
 from ui.runtime_diagnostics import RuntimeDiagnosticsMixin
 from ui.trigger_conflicts import TriggerConflictMixin
 from ui.widget_behaviors import WheelEditBlocker
+from ui.catalog_tools import CatalogToolsMixin
+from ui.system_tray import SystemTrayMixin
 
 
 class MainWindow(
@@ -120,11 +122,13 @@ class MainWindow(
     LoadingCoordinatorMixin,
     RuntimeLifecycleMixin,
     ShutdownCoordinatorMixin,
+    SystemTrayMixin,
     MacroControlsMixin,
     ProfileWorkflowMixin,
     InputListenerLifecycleMixin,
     InputRuntimeMixin,
     RecordingWorkflowMixin,
+    CatalogToolsMixin,
     MappingEditorMixin,
     PresetEditorMixin,
     EditorWorkflowMixin,
@@ -145,6 +149,7 @@ class MainWindow(
 
     def __init__(self):
         super().__init__()
+        self._initialize_system_tray_state()
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 800)
         self.setMinimumSize(760, 500)
@@ -426,6 +431,7 @@ class MainWindow(
         self.applied_config_signature = ""
         self.applied_config_payload = None
         self.build_ui()
+        self.setup_system_tray()
         self._initialize_feedback_audio()
         self.activity_overlay = ActivityOverlay()
         self.global_input_signal.connect(self.handle_global_input)
@@ -490,6 +496,8 @@ class MainWindow(
         self.backend_health_timer.timeout.connect(self.check_input_backend_health)
         self.backend_health_timer.start()
         self.initializing = False
+        self.refresh_mapping_filters()
+        self.refresh_preset_filters()
         self.refresh_status_ui()
         # 启动阶段不能固定安装 Windows 全局钩子。游戏模式且引擎处于
         # 关闭状态时，必须立即建立 control-only Interception context，
@@ -560,6 +568,7 @@ class MainWindow(
         self.global_hotkey_action.triggered.connect(
             self.open_global_hotkey_settings
         )
+        self.add_system_tray_settings(settings_menu)
         self.kanata_directory_action = settings_menu.addAction(
             "设置 Kanata 组件目录…"
         )
@@ -607,6 +616,12 @@ class MainWindow(
         )
         self.open_diagnostic_action.triggered.connect(
             self.open_diagnostic_log
+        )
+        self.export_diagnostic_bundle_action = settings_menu.addAction(
+            "导出脱敏诊断包…"
+        )
+        self.export_diagnostic_bundle_action.triggered.connect(
+            self.export_diagnostic_bundle
         )
         self.runtime_debug_action = settings_menu.addAction("运行调试器")
         self.runtime_debug_action.triggered.connect(self.open_runtime_debugger)
@@ -926,6 +941,29 @@ class MainWindow(
         header.addWidget(add)
         layout.addLayout(header)
 
+        tools = QHBoxLayout()
+        self.mapping_search = QLineEdit()
+        self.mapping_search.setPlaceholderText("搜索名称、来源、目标或执行模式…")
+        self.mapping_search.setClearButtonEnabled(True)
+        self.mapping_search.textChanged.connect(self.refresh_mapping_filters)
+        tools.addWidget(self.mapping_search, 1)
+        self.mapping_enabled_filter = QComboBox()
+        self.mapping_enabled_filter.addItems(["全部状态", "已启用", "已停用"])
+        self.mapping_enabled_filter.currentTextChanged.connect(
+            self.refresh_mapping_filters
+        )
+        tools.addWidget(self.mapping_enabled_filter)
+        self.mapping_filter_result = QLabel("显示 0 / 0")
+        self.mapping_filter_result.setObjectName("muted")
+        tools.addWidget(self.mapping_filter_result)
+        enable_filtered = QPushButton("启用筛选项")
+        enable_filtered.clicked.connect(self.enable_filtered_mappings)
+        tools.addWidget(enable_filtered)
+        disable_filtered = QPushButton("停用筛选项")
+        disable_filtered.clicked.connect(self.disable_filtered_mappings)
+        tools.addWidget(disable_filtered)
+        layout.addLayout(tools)
+
         self.mapping_scroll = QScrollArea()
         self.mapping_scroll.setWidgetResizable(True)
         self.mapping_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -965,6 +1003,29 @@ class MainWindow(
         add.clicked.connect(self.add_preset)
         header.addWidget(add)
         layout.addLayout(header)
+
+        tools = QHBoxLayout()
+        self.preset_search = QLineEdit()
+        self.preset_search.setPlaceholderText("搜索名称、触发键或执行模式…")
+        self.preset_search.setClearButtonEnabled(True)
+        self.preset_search.textChanged.connect(self.refresh_preset_filters)
+        tools.addWidget(self.preset_search, 1)
+        self.preset_enabled_filter = QComboBox()
+        self.preset_enabled_filter.addItems(["全部状态", "已启用", "已停用"])
+        self.preset_enabled_filter.currentTextChanged.connect(
+            self.refresh_preset_filters
+        )
+        tools.addWidget(self.preset_enabled_filter)
+        self.preset_filter_result = QLabel("显示 0 / 0")
+        self.preset_filter_result.setObjectName("muted")
+        tools.addWidget(self.preset_filter_result)
+        enable_filtered = QPushButton("启用筛选项")
+        enable_filtered.clicked.connect(self.enable_filtered_presets)
+        tools.addWidget(enable_filtered)
+        disable_filtered = QPushButton("停用筛选项")
+        disable_filtered.clicked.connect(self.disable_filtered_presets)
+        tools.addWidget(disable_filtered)
+        layout.addLayout(tools)
 
         self.preset_scroll = QScrollArea()
         self.preset_scroll.setWidgetResizable(True)

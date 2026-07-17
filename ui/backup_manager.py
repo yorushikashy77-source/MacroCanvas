@@ -7,10 +7,11 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
-    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
+from config.diff import build_config_diff
 from config.profiles import normalize_profile, profile_summary
 from config.schema import (
     MAX_CONFIG_FILE_BYTES, repair_duplicate_action_tree_ids,
@@ -34,9 +35,11 @@ class _SnapshotLoadSignals(QObject):
 class _SnapshotLoadTask(QRunnable):
     """Read and validate one selected snapshot outside the GUI thread."""
 
-    def __init__(self, path):
+    def __init__(self, path, current_payload=None):
         super().__init__()
         self.path = Path(path)
+        self._compare_current_payload = current_payload is not None
+        self.current_payload = current_payload or {}
         self.signals = _SnapshotLoadSignals()
 
     @Slot()
@@ -55,15 +58,18 @@ class _SnapshotLoadTask(QRunnable):
             repaired, _changes = repair_duplicate_runtime_ids(repaired)
             payload = validate_config_payload(repaired)
             summary = BackupManagerDialog._build_summary(payload)
+            diff = build_config_diff(self.current_payload, payload)
         except (
             OSError, ValueError, TypeError, json.JSONDecodeError,
             RecursionError, MemoryError,
         ) as load_error:
             error = str(load_error)
+            diff = None
         self.signals.finished.emit({
             "path": str(self.path),
             "payload": payload,
             "summary": summary,
+            "diff": diff,
             "error": error,
         })
 
@@ -71,12 +77,14 @@ class _SnapshotLoadTask(QRunnable):
 class BackupManagerDialog(QDialog):
     """Theme-matched browser for saved configuration snapshots."""
 
-    def __init__(self, backup_directory, parent=None):
+    def __init__(self, backup_directory, parent=None, current_payload=None):
         super().__init__(parent)
         self.setWindowTitle("备份配置表")
-        self.resize(930, 590)
-        self.setMinimumSize(720, 460)
+        self.resize(1000, 720)
+        self.setMinimumSize(760, 520)
         self.backup_directory = Path(backup_directory)
+        self._compare_current_payload = current_payload is not None
+        self.current_payload = current_payload or {}
         self._snapshots = []
         self._selected_snapshot = None
         self._snapshot_pool = QThreadPool.globalInstance()
@@ -169,6 +177,18 @@ class BackupManagerDialog(QDialog):
         ):
             detail_layout.addWidget(widget)
 
+        self.diff_title = QLabel("与当前配置的差异")
+        self.diff_title.setObjectName("sectionLabel")
+        detail_layout.addWidget(self.diff_title)
+        self.diff_summary = self._make_detail_label(word_wrap=True)
+        detail_layout.addWidget(self.diff_summary)
+        self.diff_checks = QFrame()
+        self.diff_checks.setObjectName("parameterArea")
+        self.diff_checks_layout = QVBoxLayout(self.diff_checks)
+        self.diff_checks_layout.setContentsMargins(10, 8, 10, 8)
+        self.diff_checks_layout.setSpacing(6)
+        detail_layout.addWidget(self.diff_checks)
+
         detail_layout.addStretch(1)
         body.addWidget(detail_card, 1)
 
@@ -179,7 +199,7 @@ class BackupManagerDialog(QDialog):
         close_button.clicked.connect(self.reject)
         buttons.addWidget(close_button)
 
-        self.restore_button = QPushButton("恢复所选备份")
+        self.restore_button = QPushButton("按所选范围恢复")
         self.restore_button.setObjectName("primary")
         self.restore_button.setEnabled(False)
         self.restore_button.clicked.connect(self._accept_selected)
@@ -295,6 +315,8 @@ class BackupManagerDialog(QDialog):
                 "size": 0,
                 "loaded": False,
                 "loading": False,
+                "diff": None,
+                "selected_sections": None,
             }
             try:
                 snapshot["size"] = path.stat().st_size
@@ -340,6 +362,68 @@ class BackupManagerDialog(QDialog):
             self.detail_note,
         ):
             widget.setText("—")
+        self._clear_diff_controls("—")
+
+    def _clear_diff_controls(self, summary="正在读取差异……"):
+        while self.diff_checks_layout.count():
+            item = self.diff_checks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.diff_summary.setText(summary)
+        self.diff_checks.setVisible(False)
+
+    def _render_diff(self, snapshot):
+        if not self._compare_current_payload:
+            self._clear_diff_controls("未提供当前配置，将按兼容模式恢复完整备份。")
+            snapshot["selected_sections"] = {
+                "content", "runtime_controls", "preferences"
+            }
+            self.restore_button.setEnabled(True)
+            return
+        diff = snapshot.get("diff") or {}
+        sections = [item for item in diff.get("sections", []) if item.get("changed")]
+        self._clear_diff_controls()
+        if not sections:
+            self.diff_summary.setText("该备份与当前配置没有可恢复的差异。")
+            self.restore_button.setEnabled(False)
+            return
+        if snapshot.get("selected_sections") is None:
+            snapshot["selected_sections"] = {
+                str(item.get("key")) for item in sections
+            }
+        valid_keys = {str(item.get("key")) for item in sections}
+        snapshot["selected_sections"].intersection_update(valid_keys)
+        self.diff_summary.setText(
+            f"共 {diff.get('change_count', 0)} 项差异；勾选要从备份恢复的区块。"
+        )
+        self.diff_checks.setVisible(True)
+        for section in sections:
+            key = str(section.get("key") or "")
+            checkbox = QCheckBox(
+                f"{section.get('label', key)}　—　{section.get('summary', '')}"
+            )
+            checkbox.setChecked(key in snapshot["selected_sections"])
+            tooltip = str(section.get("description") or "")
+            details = section.get("details", []) or []
+            if details:
+                tooltip += "\n\n" + "\n".join(details[:12])
+            checkbox.setToolTip(tooltip)
+            checkbox.toggled.connect(
+                lambda checked, s=snapshot, section_key=key:
+                self._on_diff_section_toggled(s, section_key, checked)
+            )
+            self.diff_checks_layout.addWidget(checkbox)
+        self.restore_button.setEnabled(bool(snapshot["selected_sections"]))
+
+    def _on_diff_section_toggled(self, snapshot, key, checked):
+        selected = snapshot.setdefault("selected_sections", set())
+        if checked:
+            selected.add(key)
+        else:
+            selected.discard(key)
+        if self._selected_snapshot is snapshot:
+            self.restore_button.setEnabled(bool(selected))
 
     def _on_selection_changed(self, current, _previous):
         if current is None:
@@ -368,6 +452,7 @@ class BackupManagerDialog(QDialog):
             self.detail_profile_contents.setText("档案内容：—")
             self.detail_active.setText("档案状态：—")
             self.detail_note.setText("只会读取当前选中的备份，其他备份不会阻塞窗口。")
+            self._clear_diff_controls()
             if not snapshot.get("loading"):
                 self._request_snapshot_load(snapshot)
             return
@@ -383,6 +468,7 @@ class BackupManagerDialog(QDialog):
                 "该备份无法通过当前版本的配置校验，不能直接恢复。\n"
                 f"错误：{snapshot['error'] or '未知错误'}"
             )
+            self._clear_diff_controls("该备份无法解析，不能计算差异。")
             return
 
         summary = snapshot["summary"]
@@ -414,7 +500,7 @@ class BackupManagerDialog(QDialog):
                 "恢复前请先确认驱动、Kanata 和绑定设备状态。"
             )
         self.detail_note.setText(note)
-        self.restore_button.setEnabled(True)
+        self._render_diff(snapshot)
 
     def _request_snapshot_load(self, snapshot):
         # Rapid selection changes must not start one 25 MB validation task per
@@ -424,7 +510,7 @@ class BackupManagerDialog(QDialog):
             return
         self._snapshot_load_active = True
         snapshot["loading"] = True
-        task = _SnapshotLoadTask(snapshot["path"])
+        task = _SnapshotLoadTask(snapshot["path"], self.current_payload)
         task.signals.finished.connect(self._on_snapshot_loaded)
         self._snapshot_pool.start(task)
 
@@ -440,6 +526,7 @@ class BackupManagerDialog(QDialog):
             return
         snapshot["payload"] = result.get("payload")
         snapshot["summary"] = result.get("summary")
+        snapshot["diff"] = result.get("diff")
         snapshot["error"] = str(result.get("error") or "")
         snapshot["loading"] = False
         snapshot["loaded"] = True
@@ -465,6 +552,7 @@ class BackupManagerDialog(QDialog):
             self._selected_snapshot is None
             or self._selected_snapshot.get("payload") is None
             or self._selected_snapshot.get("error")
+            or not self._selected_snapshot.get("selected_sections")
         ):
             return
         self.accept()

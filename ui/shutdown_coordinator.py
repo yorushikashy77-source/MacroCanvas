@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QMessageBox
 
@@ -422,6 +420,8 @@ class ShutdownCoordinatorMixin:
         complete = bool(keyboard_ok and main_ok and not critical_failed)
         self._shutdown_complete = complete
         if complete:
+            if hasattr(self, "dispose_system_tray"):
+                self.dispose_system_tray()
             self._shutdown_in_progress = False
             self.engine_state = EngineState.STOPPED
             self._finalize_shutdown_diagnostics(issues, complete=True)
@@ -463,6 +463,12 @@ class ShutdownCoordinatorMixin:
                 pass
 
     def closeEvent(self, event):
+        if (
+            hasattr(self, "should_hide_close_to_tray")
+            and self.should_hide_close_to_tray()
+        ):
+            self.hide_close_to_tray(event)
+            return
         if (
             getattr(self, "_shutdown_started", False)
             and not getattr(self, "_shutdown_complete", False)

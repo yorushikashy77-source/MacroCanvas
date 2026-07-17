@@ -7,13 +7,39 @@ from PySide6.QtWidgets import QMessageBox
 
 from core.constants import ACTION_ID_ROLE, ConfigState, MacroState
 from macro.actions import clone_action_tree
+from macro.simulation import simulate_preset
 from ui.runtime_guards import (
     explain_runtime_cleanup_block, runtime_cleanup_blocks_new_output,
     runtime_transaction_busy,
 )
+from ui.simulation_preview import SimulationPreviewDialog
 
 
 class ActionExecutionMixin:
+
+    def preview_selected_preset_simulation(self, card=None):
+        """Preview current editor contents without touching an input backend."""
+        if card is not None:
+            self.select_preset_card(card)
+        card = getattr(self, "selected_preset_card", None)
+        if card not in getattr(self, "preset_cards", []):
+            QMessageBox.information(self, "请选择方案", "请先选择一个预设方案。")
+            return None
+        preset = next(
+            (
+                item for item in self.collect_presets()
+                if str(item.get("id") or "") == str(card.preset_id or "")
+            ),
+            None,
+        )
+        if preset is None:
+            QMessageBox.warning(self, "无法预览", "当前预设内容无法读取。")
+            return None
+        report = simulate_preset(preset)
+        dialog = SimulationPreviewDialog(report, self)
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.exec()
+        return report
 
     def _cancel_manual_test_countdown(self, reason=""):
         """Cancel a menu/debug countdown before editable state can diverge."""
@@ -44,14 +70,15 @@ class ActionExecutionMixin:
         return explain_runtime_cleanup_block(self, context)
 
     def _runtime_transaction_blocks_manual_test(self, context):
-        """Cancel a pending manual test/debug countdown during runtime transactions."""
-        if not runtime_transaction_busy(self):
+        """Cancel a pending manual test/debug countdown during unsafe states."""
+        recording_active = bool(getattr(self, "recording_session_active", False))
+        if not runtime_transaction_busy(self) and not recording_active:
             return False
         if hasattr(self, "write_diagnostic"):
             self.write_diagnostic(
                 "manual_test_rejected",
                 context=context,
-                reason="transaction_busy",
+                reason=("recording_active" if recording_active else "transaction_busy"),
                 macro_state=str(getattr(
                     getattr(self, "macro_state", None),
                     "name",
@@ -153,10 +180,10 @@ class ActionExecutionMixin:
                 "请先选择一个普通动作，再执行其所在层级中的后续动作。",
             )
             return
-        if self.config_state == ConfigState.DIRTY:
+        if self.config_state in (ConfigState.DIRTY, ConfigState.FAILED):
             QMessageBox.information(
                 self, "存在未应用更改",
-                "当前动作包含尚未应用的修改。请先点击“应用更改”，再进行调试。",
+                "当前配置尚未成功应用。请先修正问题并点击“应用更改”，再进行调试。",
             )
             return
         if not self._macro_backend_active():
@@ -381,12 +408,11 @@ class ActionExecutionMixin:
         if row < 0:
             QMessageBox.information(self, "请选择方案", "请先选择一个预设方案。")
             return
-        if self.config_state == ConfigState.DIRTY:
+        if self.config_state in (ConfigState.DIRTY, ConfigState.FAILED):
             QMessageBox.information(
                 self,
                 "存在未应用更改",
-                "当前方案包含尚未保存或应用的修改。请先点击“应用更改”，"
-                "再进行测试。",
+                "当前配置尚未成功应用。请先修正问题并点击“应用更改”，再进行测试。",
             )
             return
         if not self._macro_backend_active():
