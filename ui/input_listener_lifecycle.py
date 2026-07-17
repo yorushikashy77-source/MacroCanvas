@@ -10,6 +10,12 @@ from engine.input_backend import InterceptionInputHook, InterceptionOutput, WinI
 
 
 class InputListenerLifecycleMixin:
+    def _input_listener_start_blocked(self):
+        return bool(
+            getattr(self, "_shutdown_started", False)
+            or getattr(self, "output_backend_retired", False)
+        )
+
     @staticmethod
     def _listener_alive(listener):
         try:
@@ -276,6 +282,8 @@ class InputListenerLifecycleMixin:
             self._set_listener_degraded("")
 
     def start_global_hook(self):
+        if self._input_listener_start_blocked():
+            return False
         if self.global_hook and self.global_hook.is_alive():
             return True
         if self.global_hook:
@@ -353,6 +361,8 @@ class InputListenerLifecycleMixin:
         game_mode = self._runtime_is_game_mode()
         if not game_mode and not control_only:
             return self._stop_interception_input_hook()
+        if self._input_listener_start_blocked():
+            return False
         if os.name != "nt":
             self.engine_hint.setText("Interception 游戏模式仅支持 Windows")
             self.engine_hint.setStyleSheet("color: #ff8496;")
@@ -537,6 +547,8 @@ class InputListenerLifecycleMixin:
             return False
 
     def restart_global_hook(self):
+        if self._input_listener_start_blocked():
+            return False
         if self.global_hook:
             stopped = self.global_hook.stop(timeout=1.5)
             if not stopped:
@@ -553,6 +565,8 @@ class InputListenerLifecycleMixin:
 
     def update_global_hook_for_backend(self):
         """Select one physical-source owner without cycling game input context."""
+        if self._input_listener_start_blocked():
+            return False
         game_mode = self._runtime_is_game_mode()
         if game_mode:
             if self.global_hook:

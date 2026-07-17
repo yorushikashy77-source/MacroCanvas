@@ -507,6 +507,11 @@ class MainWindow(
 
     def initialize_startup_input_listener(self):
         """按当前后端初始化启动监听，并为 Interception 提供有限重试。"""
+        if (
+            getattr(self, "_shutdown_started", False)
+            or getattr(self, "output_backend_retired", False)
+        ):
+            return False
         ok = self.update_global_hook_for_backend()
         if ok:
             self.write_diagnostic(

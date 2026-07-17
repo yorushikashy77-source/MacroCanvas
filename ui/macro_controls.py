@@ -15,6 +15,15 @@ from ui.runtime_guards import (
 class MacroControlsMixin:
     MACRO_STOP_TIMEOUT_SECONDS = 2.0
 
+    def _macro_callback_blocked_by_shutdown(self):
+        """Keep delayed task callbacks from reopening output during shutdown."""
+        if not getattr(self, "_shutdown_started", False):
+            return False
+        self.output_shutdown_in_progress = True
+        self._macro_stop_gate_restore = None
+        self._deferred_profile_input_restore = None
+        return True
+
     def _mark_macro_stop_started(self):
         self._macro_stop_started_at = time.perf_counter()
 
@@ -290,6 +299,8 @@ class MacroControlsMixin:
     @Slot(str)
     def on_macro_finished(self, preset_id):
         finished_task = self.macro_controller.finish(preset_id)
+        if self._macro_callback_blocked_by_shutdown():
+            return
         remaining_task = self.macro_controller.tasks.get(preset_id)
         if remaining_task is not None and remaining_task.has_live_threads():
             self.active_macro_id = preset_id
@@ -687,6 +698,8 @@ class MacroControlsMixin:
         )
 
     def _poll_stopping_macros(self):
+        if self._macro_callback_blocked_by_shutdown():
+            return
         stale_cleanup_failures = []
         with self.macro_controller.lock:
             remaining = [

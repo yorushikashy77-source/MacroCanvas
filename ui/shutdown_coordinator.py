@@ -303,6 +303,14 @@ class ShutdownCoordinatorMixin:
             self.auto_apply_timer.stop()
         self.recording_session_active = False
         self.recording = False
+        self.recording_restore_pending = False
+        self.recording_workflow_complete = False
+        self.recording_restore_layer = None
+        self.recording_generation = int(
+            getattr(self, "recording_generation", 0)
+        ) + 1
+        self._macro_stop_gate_restore = None
+        self._deferred_profile_input_restore = None
 
         # Keep the live backend ownership flags intact until every macro worker
         # has completed its final Release calls.  Worker cleanup consults

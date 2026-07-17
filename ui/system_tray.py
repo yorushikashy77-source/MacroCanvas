@@ -16,6 +16,19 @@ from ui.operation_state import operation_blocks, operation_state_snapshot
 
 
 class SystemTrayMixin:
+    def tray_visibility_requires_visible_safety_flow(self):
+        macro_state = getattr(self, "macro_state", None)
+        macro_state_name = str(
+            getattr(macro_state, "name", macro_state or "")
+        ).upper()
+        return bool(
+            getattr(self, "recording_session_active", False)
+            or (
+                macro_state_name == "COUNTDOWN"
+                and str(getattr(self, "_test_countdown_preset_id", "") or "")
+            )
+        )
+
     def _initialize_system_tray_state(self):
         self.system_tray = None
         self.close_to_tray_enabled = True
@@ -155,9 +168,14 @@ class SystemTrayMixin:
     def refresh_system_tray_actions(self):
         if not hasattr(self, "tray_mapping_action"):
             return
+        must_stay_visible = self.tray_visibility_requires_visible_safety_flow()
+        visible = self.isVisible()
         self.tray_show_action.setText(
-            "隐藏主窗口" if self.isVisible() else "显示主窗口"
+            "录制或测试期间保持显示"
+            if visible and must_stay_visible
+            else ("隐藏主窗口" if visible else "显示主窗口")
         )
+        self.tray_show_action.setEnabled(not (visible and must_stay_visible))
         self.tray_mapping_action.setText(
             "暂停全部映射"
             if getattr(self, "mappings_enabled", True)
@@ -175,11 +193,16 @@ class SystemTrayMixin:
     @Slot()
     def show_from_system_tray(self):
         if self.isVisible():
+            if self.tray_visibility_requires_visible_safety_flow():
+                self.raise_()
+                self.activateWindow()
+                return False
             self.hide()
-            return
+            return True
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        return True
 
     @Slot()
     def toggle_mappings_from_tray(self):
@@ -215,10 +238,9 @@ class SystemTrayMixin:
             self._tray_exit_requested = False
 
     def should_hide_close_to_tray(self):
-        operation = operation_state_snapshot(self)
-        requires_visible_safety_flow = operation.key in {
-            "recording", "recording_countdown", "test_countdown",
-        }
+        requires_visible_safety_flow = (
+            self.tray_visibility_requires_visible_safety_flow()
+        )
         return bool(
             self.close_to_tray_enabled
             and self.system_tray is not None
