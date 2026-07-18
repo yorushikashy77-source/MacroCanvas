@@ -151,12 +151,16 @@ class EditorWorkflowMixin:
         options = self._submacro_preset_options(card)
         table = card.action_table
         for item in table.iter_items():
-            if self.is_loop_action_item(item):
+            if (
+                self.is_loop_action_item(item)
+                or self.is_condition_branch_item(item)
+            ):
                 continue
             kind = table.itemWidget(item, 1)
             target = table.itemWidget(item, 2)
             if (
-                kind is not None and target is not None
+                hasattr(kind, "currentText")
+                and hasattr(target, "set_submacro_options")
                 and kind.currentText() == SUBMACRO_ACTION_TYPE
             ):
                 target.set_submacro_options(

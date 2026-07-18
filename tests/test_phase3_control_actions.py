@@ -385,6 +385,11 @@ class Phase3EditorTests(unittest.TestCase):
         )
         self.assertIsInstance(card.action_table.itemWidget(true_branch, 4), QLabel)
 
+        # Opening the action dialog refreshes every submacro target. Fixed
+        # branch rows use labels instead of action-type combos and must be
+        # ignored by that refresh pass.
+        harness.refresh_submacro_target_editors(card)
+
         harness.add_action({
             "action_id": "else-wait", "type": "等待", "wait_ms": 25,
         }, save=False, card=card, parent_item=else_branch)
