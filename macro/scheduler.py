@@ -950,6 +950,27 @@ class MacroTask:
         except Exception:
             return False
 
+    def _wait_for_trigger_release(self):
+        """Fence one-shot output until its physical trigger chord is released."""
+        inputs = tuple(dict.fromkeys(
+            str(value) for value in (
+                self.preset.get("_trigger_release_inputs", []) or []
+            ) if str(value)
+        ))
+        if not inputs or not callable(self.condition_state):
+            return True
+        while not self.stop_event.is_set():
+            if not self.wait_ready():
+                return False
+            if not any(self._condition_satisfied({
+                "condition_input": input_name,
+                "condition_state": "按住时",
+            }) for input_name in inputs):
+                return True
+            if self.stop_event.wait(0.005):
+                return False
+        return False
+
     @staticmethod
     def condition_branch_actions(action):
         """Return true/false branch actions, accepting legacy true-only data."""
@@ -1153,11 +1174,15 @@ class MacroTask:
         interval = int(self.preset.get("loop_interval_ms", 0))
         interval_jitter = int(self.preset.get("loop_interval_jitter_ms", 0))
         max_seconds = int(self.preset.get("max_runtime_s", 0))
-        self.started_at = time.perf_counter()
-        self.deadline = float(max_seconds) if max_seconds else 0.0
         try:
             if not actions or not self.is_active():
                 return
+            if not self._wait_for_trigger_release():
+                return
+            # Trigger-release waiting is input isolation, not macro runtime. Do
+            # not charge it against finite runtime or action timing.
+            self.started_at = time.perf_counter()
+            self.deadline = float(max_seconds) if max_seconds else 0.0
             for loop_index in range(1, max(1, loops) + 1):
                 if self.stop_event.is_set() or not self.is_active():
                     break
@@ -1277,6 +1302,40 @@ class MacroController:
             task.start()
         self.signals.state_changed.emit()
         return True
+
+    def restart(self, preset, timeout=1.0):
+        """Safely replace one live task with a fresh run of the same preset."""
+        if not self.is_active():
+            return False
+        preset_id = str(preset.get("id") or "")
+        if not preset_id:
+            return False
+        with self.lock:
+            existing = self.tasks.get(preset_id)
+        if existing is None or not existing.has_live_threads():
+            return self.start(preset)
+
+        existing.stop()
+        # A condition branch can race with the retrigger edge. Block any new
+        # output first, then immediately release output it may already own.
+        released = bool(existing.force_release())
+        exited = bool(existing.wait_for_exit(timeout=max(0.05, float(timeout))))
+        if not released or not exited or existing.has_live_threads():
+            if not released:
+                with self.lock:
+                    self._remember_release_failure_locked(preset_id)
+            self.signals.state_changed.emit()
+            return False
+        if getattr(existing, "release_cleanup_failed", False):
+            with self.lock:
+                self._remember_release_failure_locked(preset_id)
+            self.signals.state_changed.emit()
+            return False
+
+        with self.lock:
+            if self.tasks.get(preset_id) is existing:
+                self.tasks.pop(preset_id, None)
+        return self.start(preset)
 
     def finish(self, preset_id):
         finished_task = None

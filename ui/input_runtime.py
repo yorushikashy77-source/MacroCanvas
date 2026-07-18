@@ -1385,8 +1385,21 @@ class InputRuntimeMixin:
                             self._latch_sync_release_failure([mapping_id])
             return True
 
+        task = self.mapping_to_task(rule)
+        if down and task.get("execution_mode") != "按住循环":
+            source = str(rule.get("source") or trigger_name or "")
+            configured_modifiers = list(modifier_names(
+                rule.get("source_modifiers", "无")
+            ))
+            with getattr(self, "input_state_lock", nullcontext()):
+                held_modifiers = list(
+                    getattr(self, "physical_modifiers", set()) or []
+                )
+            task["_trigger_release_inputs"] = list(dict.fromkeys(
+                [source, *configured_modifiers, *held_modifiers]
+            ))
         return bool(self.handle_trigger_task(
-            self.mapping_to_task(rule), trigger_token, down, repeated
+            task, trigger_token, down, repeated
         ))
 
     def handle_trigger_task(self, task, name, down, repeated):
@@ -1435,7 +1448,17 @@ class InputRuntimeMixin:
                     return False
                 task = dict(task)
                 task["_required_profile_id"] = str(self.active_profile_id or "")
-                started = self.macro_controller.start(task)
+                restartable = mode in ("执行一次", "固定次数", "单次触发")
+                restart = getattr(self.macro_controller, "restart", None)
+                if already_running and restartable and callable(restart):
+                    started = restart(task)
+                    self.write_diagnostic(
+                        "trigger_task_restart",
+                        task_id=task_id,
+                        started=started,
+                    )
+                else:
+                    started = self.macro_controller.start(task)
                 self.write_diagnostic(
                     "trigger_task_start",
                     task_id=task_id,
