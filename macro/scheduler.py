@@ -11,6 +11,7 @@ from core.constants import (
     WAIT_CONDITION_ACTION_TYPE,
 )
 from macro.actions import clone_action_tree
+from macro.parameters import resolve_action_parameters
 from engine.window_context import (
     foreground_window_identity,
     foreground_window_identity_matches,
@@ -35,7 +36,15 @@ class MacroTask:
         expect_output=None, send_output=None, is_active=None,
         profile_active=None, quarantine_release=None, condition_state=None,
     ):
-        self.preset = preset
+        # Resolve root defaults before action IDs and loop references are
+        # indexed. Presets without named parameters retain the legacy action
+        # path and avoid an unnecessary deep copy on every trigger.
+        self.preset = dict(preset)
+        self.preset["actions"] = (
+            resolve_action_parameters(preset.get("actions", []), preset)
+            if preset.get("parameters")
+            else preset.get("actions", [])
+        )
         self.engine = engine
         self.signals = signals
         self.expect_output = expect_output
@@ -1025,8 +1034,16 @@ class MacroTask:
         effective_speed = max(
             10, min(500, round(parent_speed * local_speed / 100))
         )
+        resolved_actions = (
+            resolve_action_parameters(
+                target.get("actions", []), target,
+                action.get("parameter_values", {}),
+            )
+            if target.get("parameters")
+            else target.get("actions", [])
+        )
         called_actions = self._mark_submacro_call_stack(
-            target.get("actions", []), stack + (target_id,)
+            resolved_actions, stack + (target_id,)
         )
         self._emit_action_activity(action, extra=target.get("name", target_id))
         for _index in range(repeat_count):

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from config.schema import (
@@ -28,6 +28,11 @@ from engine.kanata import (
 )
 from macro.actions import clone_action_tree, iter_action_tree
 from macro.recording import simplify_recorded_actions
+from macro.parameters import (
+    ACTION_PARAMETER_FIELDS, FIELD_LABELS, MAX_PRESET_PARAMETERS,
+    PARAMETER_DURATION, PARAMETER_INPUT, PARAMETER_TYPES,
+    coerce_parameter_value, value_matches_action_field,
+)
 from ui.editors import (
     ActionDurationEditor, ActionTargetEditor, ActionTreeWidget, HotkeyEdit,
 )
@@ -36,9 +41,392 @@ from ui.editors import (
 ACTION_RECORDING_CONTEXT_ROLE = ACTION_ID_ROLE + 1
 ACTION_LEGACY_MODIFIERS_ROLE = ACTION_RECORDING_CONTEXT_ROLE + 1
 ACTION_BRANCH_TYPE_ROLE = ACTION_LEGACY_MODIFIERS_ROLE + 1
+ACTION_PARAMETER_BINDINGS_ROLE = ACTION_BRANCH_TYPE_ROLE + 1
+ACTION_PARAMETER_VALUES_ROLE = ACTION_PARAMETER_BINDINGS_ROLE + 1
 
 
 class EditorWorkflowMixin:
+    @staticmethod
+    def _preset_parameter_definitions(card):
+        return copy.deepcopy(getattr(card, "parameter_definitions", []) or [])
+
+    def _card_for_action_table(self, table):
+        return next(
+            (
+                card for card in getattr(self, "preset_cards", [])
+                if getattr(card, "action_table", None) is table
+            ),
+            None,
+        )
+
+    def _update_action_variable_marker(self, item):
+        if item is None or self.is_condition_branch_item(item):
+            return
+        bindings = dict(item.data(0, ACTION_PARAMETER_BINDINGS_ROLE) or {})
+        values = dict(item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {})
+        base = (
+            "循环卡片" if self.is_loop_action_item(item)
+            else "子动作" if item.parent() is not None else "动作"
+        )
+        item.setText(0, base + (" ◇" if bindings or values else ""))
+        original_tip = str(item.toolTip(0) or "").split("\n变量：", 1)[0]
+        details = []
+        if bindings:
+            details.append(f"已绑定 {len(bindings)} 个字段")
+        if values:
+            details.append(f"已覆盖 {len(values)} 个子宏变量")
+        item.setToolTip(
+            0,
+            original_tip + ("\n变量：" + "；".join(details) if details else ""),
+        )
+
+    def edit_preset_variables(self, card):
+        """Edit named defaults declared by one reusable preset."""
+        dialog = QDialog(getattr(card, "action_dialog", None) or self)
+        dialog.setWindowTitle("定义预设变量")
+        dialog.resize(610, 420)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "变量让同一预设在被子宏调用时使用不同的按键、次数或时长。"
+            "名称在当前预设内不能重复；重命名或删除变量会清理原有引用。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["变量名称", "类型", "默认值"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        layout.addWidget(table, 1)
+
+        def add_row(definition=None):
+            if table.rowCount() >= MAX_PRESET_PARAMETERS:
+                QMessageBox.information(
+                    dialog, "已达到上限",
+                    f"每个预设最多可定义 {MAX_PRESET_PARAMETERS} 个变量。",
+                )
+                return
+            definition = dict(definition or {})
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(str(definition.get("name") or "")))
+            kind = QComboBox()
+            kind.addItems(PARAMETER_TYPES)
+            kind.setCurrentText(str(definition.get("type") or PARAMETER_INPUT))
+            table.setCellWidget(row, 1, kind)
+            table.setItem(
+                row, 2,
+                QTableWidgetItem(str(definition.get("default", "A"))),
+            )
+
+        for definition in self._preset_parameter_definitions(card):
+            add_row(definition)
+        row_buttons = QHBoxLayout()
+        add_button = QPushButton("＋ 添加变量")
+        add_button.setObjectName("secondary")
+        add_button.clicked.connect(lambda _checked=False: add_row())
+        remove_button = QPushButton("删除选中")
+        remove_button.setObjectName("dangerGhost")
+        remove_button.clicked.connect(
+            lambda _checked=False: table.removeRow(table.currentRow())
+            if table.currentRow() >= 0 else None
+        )
+        row_buttons.addWidget(add_button)
+        row_buttons.addWidget(remove_button)
+        row_buttons.addStretch(1)
+        layout.addLayout(row_buttons)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def accept():
+            definitions = []
+            names = set()
+            for row in range(table.rowCount()):
+                name_item = table.item(row, 0)
+                default_item = table.item(row, 2)
+                name = str(name_item.text() if name_item else "").strip()
+                kind = table.cellWidget(row, 1).currentText()
+                if not name:
+                    QMessageBox.warning(dialog, "变量无效", f"第 {row + 1} 行没有名称。")
+                    return
+                if len(name) > 32:
+                    QMessageBox.warning(dialog, "变量无效", f"变量“{name}”名称超过 32 个字符。")
+                    return
+                if name in names:
+                    QMessageBox.warning(dialog, "变量无效", f"变量“{name}”重复。")
+                    return
+                try:
+                    default = coerce_parameter_value(
+                        kind, default_item.text() if default_item else ""
+                    )
+                except ValueError as error:
+                    QMessageBox.warning(
+                        dialog, "默认值无效", f"变量“{name}”：{error}"
+                    )
+                    return
+                names.add(name)
+                definitions.append({"name": name, "type": kind, "default": default})
+            card.parameter_definitions = definitions
+            self._sanitize_named_parameter_metadata()
+            self.data_changed()
+            dialog.accept()
+
+        buttons.accepted.connect(accept)
+        dialog.exec()
+
+    def edit_selected_action_variables(self, card):
+        selected = [
+            item for item in self.selected_action_items(card)
+            if not self.is_condition_branch_item(item)
+        ]
+        if len(selected) != 1:
+            QMessageBox.information(
+                getattr(card, "action_dialog", None) or self,
+                "请选择一个动作", "请先选中一个普通动作或子宏动作。",
+            )
+            return
+        item = selected[0]
+        action = self.action_from_item(card.action_table, item)
+        if action.get("type") == SUBMACRO_ACTION_TYPE:
+            self._edit_submacro_parameter_values(card, item, action)
+        else:
+            self._edit_action_parameter_bindings(card, item, action)
+
+    def _edit_action_parameter_bindings(self, card, item, action):
+        fields = ACTION_PARAMETER_FIELDS.get(action.get("type"), {})
+        definitions = self._preset_parameter_definitions(card)
+        compatible = {
+            field: [
+                definition for definition in definitions
+                if value_matches_action_field(
+                    action.get("type"), field, definition.get("type"),
+                    definition.get("default"),
+                )
+            ]
+            for field in fields
+        }
+        if not fields or not any(compatible.values()):
+            QMessageBox.information(
+                card.action_dialog, "没有可用变量",
+                "当前动作没有可绑定字段，或本预设尚未定义类型匹配的变量。\n"
+                "可先点击“定义变量”添加默认值。",
+            )
+            return
+        dialog = QDialog(card.action_dialog)
+        dialog.setWindowTitle("绑定动作变量")
+        form = QFormLayout(dialog)
+        current = dict(item.data(0, ACTION_PARAMETER_BINDINGS_ROLE) or {})
+        controls = {}
+        for field in fields:
+            combo = QComboBox()
+            combo.addItem("不使用变量", "")
+            for definition in compatible[field]:
+                combo.addItem(definition["name"], definition["name"])
+            selected = combo.findData(str(current.get(field) or ""))
+            combo.setCurrentIndex(max(0, selected))
+            literal = action.get(field, "")
+            form.addRow(f"{FIELD_LABELS.get(field, field)}（当前 {literal}）", combo)
+            controls[field] = combo
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        bindings = {
+            field: str(combo.currentData())
+            for field, combo in controls.items() if combo.currentData()
+        }
+        item.setData(0, ACTION_PARAMETER_BINDINGS_ROLE, bindings)
+        if self.is_loop_action_item(item):
+            data = dict(item.data(0, LOOP_DATA_ROLE) or {})
+            data["parameter_bindings"] = bindings
+            item.setData(0, LOOP_DATA_ROLE, data)
+        self._update_action_variable_marker(item)
+        self.action_changed(card)
+
+    def _edit_submacro_parameter_values(self, card, item, action):
+        target_id = str(action.get("preset_id") or "")
+        target_card = next(
+            (other for other in self.preset_cards if other.preset_id == target_id),
+            None,
+        )
+        definitions = self._preset_parameter_definitions(target_card) if target_card else []
+        if not definitions:
+            QMessageBox.information(
+                card.action_dialog, "目标没有变量",
+                "当前子宏目标尚未定义可覆盖的变量。",
+            )
+            return
+        dialog = QDialog(card.action_dialog)
+        dialog.setWindowTitle("设置子宏变量")
+        form = QFormLayout(dialog)
+        current = dict(item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {})
+        usages = {}
+        target_actions = (
+            self.collect_visible_actions(target_card) if target_card is not None else []
+        )
+        for target_action in iter_action_tree(target_actions):
+            action_specs = ACTION_PARAMETER_FIELDS.get(
+                target_action.get("type"), {}
+            )
+            for field, parameter_name in (
+                target_action.get("parameter_bindings", {}) or {}
+            ).items():
+                spec = action_specs.get(field)
+                if spec is not None:
+                    usages.setdefault(str(parameter_name), []).append(spec)
+        controls = {}
+        for definition in definitions:
+            name = definition["name"]
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            enabled = QCheckBox("覆盖默认值")
+            enabled.setChecked(name in current)
+            if definition["type"] == PARAMETER_INPUT:
+                editor = QComboBox()
+                allowed = set(INPUT_NAMES)
+                for _kind, _minimum, _maximum, choices in usages.get(name, []):
+                    if choices is not None:
+                        allowed.intersection_update(choices)
+                editor.addItems([value for value in INPUT_NAMES if value in allowed])
+                editor.setCurrentText(str(current.get(name, definition["default"])))
+            else:
+                editor = QSpinBox()
+                minimum = 0 if definition["type"] == PARAMETER_DURATION else 1
+                maximum = (
+                    600_000 if definition["type"] == PARAMETER_DURATION else 100_000
+                )
+                for _kind, field_minimum, field_maximum, _choices in usages.get(name, []):
+                    if field_minimum is not None:
+                        minimum = max(minimum, field_minimum)
+                    if field_maximum is not None:
+                        maximum = min(maximum, field_maximum)
+                editor.setRange(minimum, maximum)
+                editor.setSuffix(" ms" if definition["type"] == PARAMETER_DURATION else "")
+                editor.setValue(int(current.get(name, definition["default"])))
+            editor.setEnabled(enabled.isChecked())
+            enabled.toggled.connect(editor.setEnabled)
+            row_layout.addWidget(enabled)
+            row_layout.addWidget(editor, 1)
+            form.addRow(f"{name}（{definition['type']}）", row)
+            controls[name] = (enabled, editor, definition)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = {}
+        for name, (enabled, editor, definition) in controls.items():
+            if not enabled.isChecked():
+                continue
+            raw = editor.currentText() if isinstance(editor, QComboBox) else editor.value()
+            values[name] = coerce_parameter_value(definition["type"], raw)
+        item.setData(0, ACTION_PARAMETER_VALUES_ROLE, values)
+        self._update_action_variable_marker(item)
+        self.action_changed(card)
+
+    def _sanitize_named_parameter_metadata(self):
+        """Drop stale bindings/overrides after declarations or targets change."""
+        definitions_by_id = {
+            card.preset_id: {
+                item["name"]: item for item in self._preset_parameter_definitions(card)
+            }
+            for card in getattr(self, "preset_cards", [])
+        }
+        for card in getattr(self, "preset_cards", []):
+            own = definitions_by_id.get(card.preset_id, {})
+            if not getattr(card, "_actions_loaded", True):
+                actions = clone_action_tree(getattr(card, "_pending_actions", []) or [])
+                for action in iter_action_tree(actions):
+                    action["parameter_bindings"] = {
+                        field: name for field, name in
+                        (action.get("parameter_bindings", {}) or {}).items()
+                        if (
+                            name in own
+                            and value_matches_action_field(
+                                action.get("type"), field,
+                                own[name].get("type"), own[name].get("default"),
+                            )
+                        )
+                    }
+                    if not action["parameter_bindings"]:
+                        action.pop("parameter_bindings", None)
+                    if action.get("type") == SUBMACRO_ACTION_TYPE:
+                        target = definitions_by_id.get(str(action.get("preset_id") or ""), {})
+                        valid_values = {}
+                        for name, value in (action.get("parameter_values", {}) or {}).items():
+                            definition = target.get(name)
+                            if definition is None:
+                                continue
+                            try:
+                                valid_values[name] = coerce_parameter_value(
+                                    definition["type"], value
+                                )
+                            except ValueError:
+                                continue
+                        action["parameter_values"] = valid_values
+                        if not action["parameter_values"]:
+                            action.pop("parameter_values", None)
+                card._pending_actions = actions
+                continue
+            for item in card.action_table.iter_items():
+                action_type = (
+                    LOOP_ACTION_TYPE if self.is_loop_action_item(item) else ""
+                )
+                kind_editor = card.action_table.itemWidget(item, 1)
+                if not action_type and kind_editor is not None and hasattr(kind_editor, "currentText"):
+                    action_type = kind_editor.currentText()
+                bindings = {
+                    field: name for field, name in
+                    (item.data(0, ACTION_PARAMETER_BINDINGS_ROLE) or {}).items()
+                    if (
+                        name in own
+                        and value_matches_action_field(
+                            action_type, field, own[name].get("type"),
+                            own[name].get("default"),
+                        )
+                    )
+                }
+                item.setData(0, ACTION_PARAMETER_BINDINGS_ROLE, bindings)
+                if self.is_loop_action_item(item):
+                    data = dict(item.data(0, LOOP_DATA_ROLE) or {})
+                    if bindings:
+                        data["parameter_bindings"] = bindings
+                    else:
+                        data.pop("parameter_bindings", None)
+                    item.setData(0, LOOP_DATA_ROLE, data)
+                if action_type == SUBMACRO_ACTION_TYPE:
+                    target_editor = card.action_table.itemWidget(item, 2)
+                    target = definitions_by_id.get(str(target_editor.currentText() or ""), {})
+                    values = {}
+                    for name, value in (item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {}).items():
+                        definition = target.get(name)
+                        if definition is None:
+                            continue
+                        try:
+                            values[name] = coerce_parameter_value(
+                                definition["type"], value
+                            )
+                        except ValueError:
+                            continue
+                    item.setData(0, ACTION_PARAMETER_VALUES_ROLE, values)
+                self._update_action_variable_marker(item)
+
     @staticmethod
     def semantic_action_count(actions):
         return sum(
@@ -627,7 +1015,7 @@ class EditorWorkflowMixin:
             if value and value not in seen:
                 seen.add(value)
                 target_ids.append(value)
-        return {
+        normalized = {
             "id": str(action.get("id") or uuid.uuid4().hex),
             "type": LOOP_ACTION_TYPE,
             "sequence_number": sequence_number,
@@ -649,6 +1037,10 @@ class EditorWorkflowMixin:
                 action.get("color_index", sequence_number - 1)
             ) % len(LOOP_COLOR_THEMES),
         }
+        bindings = dict(action.get("parameter_bindings", {}) or {})
+        if bindings:
+            normalized["parameter_bindings"] = bindings
+        return normalized
 
     @staticmethod
     def is_loop_action_item(item):
@@ -889,6 +1281,14 @@ class EditorWorkflowMixin:
         if legacy_modifiers not in MODIFIER_OPTIONS:
             legacy_modifiers = "无"
         item.setData(0, ACTION_LEGACY_MODIFIERS_ROLE, legacy_modifiers)
+        item.setData(
+            0, ACTION_PARAMETER_BINDINGS_ROLE,
+            copy.deepcopy(action.get("parameter_bindings", {}) or {}),
+        )
+        item.setData(
+            0, ACTION_PARAMETER_VALUES_ROLE,
+            copy.deepcopy(action.get("parameter_values", {}) or {}),
+        )
         recording_context = action.get("recording_context")
         if (
             action.get("type") == "鼠标移动"
@@ -1084,6 +1484,7 @@ class EditorWorkflowMixin:
             self.update_condition_branch_summary(table, item)
         if parent_item is not None and self.is_condition_branch_item(parent_item):
             self.update_condition_branch_summary(table, parent_item)
+        self._update_action_variable_marker(item)
         if not getattr(self, "_bulk_loading_actions", False):
             table.setCurrentItem(item)
             self.update_card_action_summary(card)
@@ -1531,6 +1932,26 @@ class EditorWorkflowMixin:
             "type": action_type,
             "action_id": str(item.data(0, ACTION_ID_ROLE) or uuid.uuid4().hex),
         }
+        bindings = dict(item.data(0, ACTION_PARAMETER_BINDINGS_ROLE) or {})
+        allowed_fields = ACTION_PARAMETER_FIELDS.get(action_type, {})
+        card = self._card_for_action_table(table)
+        definitions = {
+            definition["name"]: definition
+            for definition in self._preset_parameter_definitions(card)
+        } if card is not None else {}
+        bindings = {
+            field: name for field, name in bindings.items()
+            if (
+                field in allowed_fields
+                and name in definitions
+                and value_matches_action_field(
+                    action_type, field, definitions[name].get("type"),
+                    definitions[name].get("default"),
+                )
+            )
+        }
+        if bindings:
+            action["parameter_bindings"] = bindings
         stored_recording = item.data(0, ACTION_RECORDING_CONTEXT_ROLE)
         duration = table.itemWidget(item, 3)
         if action_type == CONDITION_ACTION_TYPE:
@@ -1551,6 +1972,35 @@ class EditorWorkflowMixin:
                 "repeat_count": duration.value(),
                 "speed_percent": duration.callSpeedValue(),
             })
+            target_card = next(
+                (
+                    other for other in getattr(self, "preset_cards", [])
+                    if other.preset_id == action["preset_id"]
+                ),
+                None,
+            )
+            target_names = {
+                definition["name"]
+                for definition in self._preset_parameter_definitions(target_card)
+            } if target_card is not None else set()
+            target_definitions = {
+                definition["name"]: definition
+                for definition in self._preset_parameter_definitions(target_card)
+            } if target_card is not None else {}
+            values = {}
+            for name, value in (
+                item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {}
+            ).items():
+                if name not in target_names:
+                    continue
+                try:
+                    values[name] = coerce_parameter_value(
+                        target_definitions[name]["type"], value
+                    )
+                except ValueError:
+                    continue
+            if values:
+                action["parameter_values"] = values
         elif action_type == "等待":
             action["wait_ms"] = duration.value()
             action["jitter_ms"] = duration.jitterValue()
@@ -2174,6 +2624,7 @@ class EditorWorkflowMixin:
                     card.max_runtime.value()
                     if mode in ("开关循环", "无限循环") else 0
                 ),
+                "parameters": self._preset_parameter_definitions(card),
                 "actions": self.collect_visible_actions(card),
             })
         return result

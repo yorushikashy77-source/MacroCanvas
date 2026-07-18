@@ -1871,6 +1871,7 @@ class MainWindow(
             "condition_input": copied.get("condition_input", "鼠标左键"),
             "condition_state": copied.get("condition_state", "按住时"),
             "name": copied.get("name", "预设"),
+            "parameters": copy.deepcopy(copied.get("parameters", [])),
             "actions": clone_action_tree(copied.get("actions", [])),
             "_preset_library": copied.get("_preset_library", {}),
             "_runtime_kind": "preset",

@@ -46,6 +46,11 @@ class PresetEditorMixin:
         card.setObjectName("presetCard")
         card.setProperty("selected", False)
         card.preset_id = preset.get("id") or uuid.uuid4().hex
+        card.parameter_definitions = [
+            dict(definition)
+            for definition in preset.get("parameters", []) or []
+            if isinstance(definition, dict)
+        ]
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(12, 7, 12, 8)
         card_layout.setSpacing(5)
@@ -217,6 +222,21 @@ class PresetEditorMixin:
         card.action_title = QLabel("动作组 · 0 组 / 0 项")
         card.action_title.setObjectName("sectionLabel")
         action_header.addWidget(card.action_title)
+        define_variables = QPushButton("定义变量")
+        define_variables.setObjectName("secondary")
+        define_variables.setToolTip("声明该预设可复用的按键、整数或时长默认值")
+        define_variables.clicked.connect(
+            lambda _checked=False, c=card: self.edit_preset_variables(c)
+        )
+        action_variables = QPushButton("动作变量")
+        action_variables.setObjectName("secondary")
+        action_variables.setToolTip("为选中动作绑定变量；选中子宏时设置调用覆盖值")
+        action_variables.clicked.connect(
+            lambda _checked=False, c=card:
+            self.edit_selected_action_variables(c)
+        )
+        action_header.addWidget(define_variables)
+        action_header.addWidget(action_variables)
         action_header.addStretch()
         up = QPushButton("↑")
         up.setToolTip("在同一层级内上移")
@@ -422,6 +442,8 @@ class PresetEditorMixin:
             "条件动作下的“条件成立”和“否则”是固定分支；"
             "选中分支后使用上方按钮添加动作，也可在两个分支间拖动普通动作。"
             "“子宏”可调用同一配置方案中的其他预设，并单独设置次数与速度。"
+            "“定义变量”可声明按键、整数和时长默认值；“动作变量”可让选中动作引用变量，"
+            "或在调用子宏时覆盖目标预设的默认值。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("muted")

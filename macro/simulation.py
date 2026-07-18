@@ -9,6 +9,7 @@ from core.constants import (
     SUBMACRO_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
 )
 from macro.scheduler import LOOP_ACTION_TYPE, MacroTask
+from macro.parameters import resolve_action_parameters
 
 
 def _bounded_int(value, default=0, minimum=0, maximum=2_147_483_647):
@@ -96,8 +97,16 @@ def _action_group_duration(action, speed, library=None, call_stack=()):
             effective_speed = max(
                 10, min(500, round(speed * local_speed / 100))
             )
+            called_actions = (
+                resolve_action_parameters(
+                    target.get("actions", []), target,
+                    action.get("parameter_values", {}),
+                )
+                if target.get("parameters")
+                else target.get("actions", [])
+            )
             called_min, called_max = _sequence_duration(
-                target.get("actions", []), effective_speed,
+                called_actions, effective_speed,
                 library=library, call_stack=call_stack + (target_id,),
             )
             repeats = _bounded_int(
@@ -322,7 +331,11 @@ def _timeline_events(
 
 def simulate_preset(preset, max_events=500):
     """Return a bounded preview without starting an engine or sending input."""
-    actions = list(preset.get("actions", []) or [])
+    actions = (
+        resolve_action_parameters(preset.get("actions", []), preset)
+        if preset.get("parameters")
+        else list(preset.get("actions", []) or [])
+    )
     speed = _bounded_int(preset.get("speed_percent", 100), 100, 10, 500)
     library = preset.get("_preset_library", {})
     if not isinstance(library, dict):

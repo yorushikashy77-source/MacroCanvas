@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
 
 from config.profiles import profile_summary
 from config.schema import validate_config_payload
@@ -324,10 +324,13 @@ class _EditorHarness(EditorWorkflowMixin):
         pass
 
 
-def _action_card():
+def _action_card(preset_id="root", parameters=None):
     table = ActionTreeWidget()
     table.setColumnCount(5)
     return SimpleNamespace(
+        preset_id=preset_id,
+        name=QLineEdit(preset_id),
+        parameter_definitions=list(parameters or []),
         action_table=table,
         action_title=QLabel(),
         loop_points_button=QPushButton(),
@@ -359,6 +362,34 @@ class Phase3EditorTests(unittest.TestCase):
         duration.setConditionState("松开时")
         self.assertEqual(duration.value(), 0)
         self.assertEqual(duration.conditionState(), "松开时")
+
+    def test_named_bindings_and_call_overrides_survive_row_rebuild(self):
+        harness = _EditorHarness()
+        child = _action_card("child", [{
+            "name": "目标键", "type": "按键", "default": "A",
+        }])
+        root = _action_card("root", [{
+            "name": "延迟", "type": "时长", "default": 25,
+        }])
+        harness.preset_cards.extend([root, child])
+
+        wait_item = harness.add_action({
+            "action_id": "wait", "type": "等待", "wait_ms": 10,
+            "parameter_bindings": {"wait_ms": "延迟"},
+        }, save=False, card=root)
+        rebuilt_wait = harness.action_from_item(root.action_table, wait_item)
+        self.assertEqual(
+            rebuilt_wait["parameter_bindings"], {"wait_ms": "延迟"}
+        )
+
+        call_item = harness.add_action({
+            "action_id": "call", "type": "调用子宏",
+            "preset_id": "child", "repeat_count": 1,
+            "speed_percent": 100,
+            "parameter_values": {"目标键": "B"},
+        }, save=False, card=root)
+        rebuilt_call = harness.action_from_item(root.action_table, call_item)
+        self.assertEqual(rebuilt_call["parameter_values"], {"目标键": "B"})
 
     def test_legacy_condition_is_rendered_with_two_fixed_branches(self):
         harness = _EditorHarness()
