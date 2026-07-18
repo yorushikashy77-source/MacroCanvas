@@ -14,10 +14,22 @@ class HotkeyEditorIntegrationStaticTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("allow_condition=True", mapping_text)
-        self.assertIn("condition_options=SOURCE_NAMES", mapping_text)
+        self.assertIn("condition_options=CONDITION_INPUT_NAMES", mapping_text)
         self.assertNotIn('QCheckBox("附加触发条件")', mapping_text)
         self.assertNotIn("card.condition_row", mapping_text)
         self.assertIn("card.source_hotkey.condition_value()", workflow_text)
+
+    def test_preset_condition_is_owned_by_trigger_hotkey_editor(self):
+        preset_text = (ROOT / "ui" / "preset_editor.py").read_text(
+            encoding="utf-8"
+        )
+        workflow_text = (ROOT / "ui" / "editor_workflow.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("card.trigger_hotkey = HotkeyEdit(", preset_text)
+        self.assertIn("allow_condition=True", preset_text)
+        self.assertIn("condition_options=CONDITION_INPUT_NAMES", preset_text)
+        self.assertIn("card.trigger_hotkey.condition_value()", workflow_text)
 
     def test_manual_dialog_contains_condition_controls(self):
         editors_text = (ROOT / "ui" / "editors.py").read_text(

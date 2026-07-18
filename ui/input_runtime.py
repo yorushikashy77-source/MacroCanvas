@@ -51,6 +51,14 @@ from ui.runtime_guards import (
 
 class InputRuntimeMixin:
 
+    def _macro_action_condition_satisfied(self, input_name, state="按住时"):
+        """Read only physical input state for worker-thread control actions."""
+        with getattr(self, "input_state_lock", nullcontext()):
+            held = str(input_name or "") in set(
+                getattr(self, "physical_down", set())
+            )
+        return held if state == "按住时" else not held
+
     def _runtime_cleanup_blocks_new_output(self):
         return runtime_cleanup_blocks_new_output(self)
 
@@ -1277,6 +1285,7 @@ class InputRuntimeMixin:
                 "speed_percent": int(mapping.get("speed_percent", 100)),
                 "max_runtime_s": int(mapping.get("max_runtime_s", 0)),
                 "actions": clone_action_tree(mapping.get("actions", [])),
+                "_preset_library": mapping.get("_preset_library", {}),
             }
 
         target = mapping.get("target", "A")
@@ -1330,7 +1339,6 @@ class InputRuntimeMixin:
             return False
         if (
             down
-            and rule.get("_runtime_kind", "mapping") == "mapping"
             and rule.get("condition_enabled", False)
             and not rule.get("_condition_prevalidated", False)
         ):
@@ -1419,6 +1427,12 @@ class InputRuntimeMixin:
                 )
                 return stopped
             else:
+                issue = self._recorded_mouse_context_issue(task.get("actions", []))
+                if issue is not None:
+                    self._report_recorded_mouse_context_issue(
+                        task, issue, source="trigger"
+                    )
+                    return False
                 task = dict(task)
                 task["_required_profile_id"] = str(self.active_profile_id or "")
                 started = self.macro_controller.start(task)
@@ -1602,6 +1616,83 @@ class InputRuntimeMixin:
             current_process, _current_title = foreground_window_context()
             return current_process.casefold() == expected_process.casefold()
         return True
+
+    def _recorded_mouse_context_issue(self, actions):
+        """Return the first display-layout mismatch that is unsafe to start.
+
+        Window/client actions intentionally are not checked here: a menu test
+        temporarily makes MacroCanvas the foreground window during its countdown.
+        They remain checked at send time after focus has returned to the target.
+        """
+        for action in iter_action_tree(actions):
+            if action.get("type") != "鼠标移动":
+                continue
+            context = action.get("recording_context")
+            if not isinstance(context, dict):
+                continue
+            mode = str(context.get("mode") or "")
+            if mode == "screen" and context.get("virtual_screen"):
+                try:
+                    expected = tuple(
+                        int(value) for value in context["virtual_screen"]
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    return {
+                        "kind": "screen",
+                        "expected": (),
+                        "current": tuple(self._virtual_screen_geometry()),
+                        "target": str(action.get("target") or ""),
+                        "invalid_context": True,
+                    }
+                current = tuple(self._virtual_screen_geometry())
+                if expected != current:
+                    return {
+                        "kind": "screen",
+                        "expected": expected,
+                        "current": current,
+                        "target": str(action.get("target") or ""),
+                    }
+            elif mode == "pct" and context.get("monitor_count") not in (None, ""):
+                try:
+                    expected_count = int(context["monitor_count"])
+                    current_count = int(ctypes.windll.user32.GetSystemMetrics(80))
+                except (TypeError, ValueError, OverflowError, OSError):
+                    return {
+                        "kind": "monitor_count",
+                        "expected": context.get("monitor_count"),
+                        "current": None,
+                        "target": str(action.get("target") or ""),
+                    }
+                if expected_count != current_count:
+                    return {
+                        "kind": "monitor_count",
+                        "expected": expected_count,
+                        "current": current_count,
+                        "target": str(action.get("target") or ""),
+                    }
+        return None
+
+    def _report_recorded_mouse_context_issue(self, task, issue, source):
+        """Report a rejected hotkey start on the GUI thread without stealing focus."""
+        payload = dict(issue or {})
+        payload.update({
+            "preset_id": str((task or {}).get("id") or ""),
+            "preset_name": str((task or {}).get("name") or "宏任务"),
+            "source": str(source or "runtime"),
+        })
+        self.write_diagnostic(
+            "recorded_mouse_context_start_blocked",
+            force=True,
+            preset_id=payload["preset_id"],
+            preset_name=payload["preset_name"],
+            source=payload["source"],
+            issue=payload,
+        )
+        signal = getattr(self, "recorded_mouse_context_mismatch_signal", None)
+        if signal is not None:
+            signal.emit(payload)
+        if hasattr(self, "_play_feedback"):
+            self._play_feedback("error")
 
     def _send_interception_action(self, action, phase):
         if getattr(self, "output_backend_retired", False):
@@ -1888,11 +1979,14 @@ class InputRuntimeMixin:
 
         rules = self._runtime_mapping_rules() if has_held_tasks else []
         held_rule_by_task = {
-            f"mapping:{rule.get('id')}": rule
+            (
+                str(rule.get("id"))
+                if rule.get("_runtime_kind") == "preset"
+                else f"mapping:{rule.get('id')}"
+            ): rule
             for rule in rules
             if (
-                rule.get("_runtime_kind", "mapping") == "mapping"
-                and rule.get("condition_enabled", False)
+                rule.get("condition_enabled", False)
                 and rule.get("mode", "同步按住") == "按住循环"
             )
         }

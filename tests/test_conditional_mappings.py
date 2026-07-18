@@ -10,6 +10,51 @@ from ui.trigger_conflicts import TriggerConflictMixin
 
 
 class MappingConditionModelTests(unittest.TestCase):
+    def test_escape_is_allowed_for_conditions_and_manual_trigger_sources(self):
+        mapping = {
+            "id": "m-esc",
+            "enabled": True,
+            "source_modifiers": "无",
+            "source": "F1",
+            "target_modifiers": "无",
+            "target": "A",
+            "condition_enabled": True,
+            "condition_input": "Esc",
+            "condition_state": "按住时",
+        }
+        preset = {
+            "id": "p-esc",
+            "enabled": False,
+            "trigger_modifiers": "无",
+            "trigger": "F2",
+            "condition_enabled": True,
+            "condition_input": "Esc",
+            "condition_state": "松开时",
+            "actions": [{
+                "action_id": "a-esc",
+                "type": "条件分支",
+                "condition_input": "Esc",
+                "condition_state": "按住时",
+                "children": [],
+            }],
+        }
+        payload = {"mappings": [mapping], "presets": [preset]}
+        self.assertIs(validate_config_payload(payload), payload)
+
+        escape_sources = {
+            "mappings": [dict(mapping, source="Esc")],
+            "presets": [dict(preset, trigger="Esc")],
+        }
+        self.assertIs(validate_config_payload(escape_sources), escape_sources)
+
+        invalid_system_hotkey = {
+            "global_toggle_enabled": True,
+            "global_toggle_modifiers": "无",
+            "global_toggle_key": "Esc",
+        }
+        with self.assertRaises(ValueError):
+            validate_config_payload(invalid_system_hotkey)
+
     def test_pressed_and_released_states_use_current_physical_snapshot(self):
         pressed = {
             "condition_enabled": True,
@@ -43,6 +88,31 @@ class MappingConditionModelTests(unittest.TestCase):
         }], "presets": []}
         with self.assertRaises(ValueError):
             validate_config_payload(invalid)
+
+        preset = {
+            "id": "p1",
+            "enabled": False,
+            "trigger_modifiers": "无",
+            "trigger": "F1",
+            "condition_enabled": True,
+            "condition_input": "鼠标左键",
+            "condition_state": "按住时",
+            "actions": [],
+        }
+        preset_payload = {"mappings": [], "presets": [preset]}
+        self.assertIs(validate_config_payload(preset_payload), preset_payload)
+        invalid_preset = {"mappings": [], "presets": [{
+            key: value for key, value in preset.items()
+            if key != "condition_state"
+        }]}
+        with self.assertRaises(ValueError):
+            validate_config_payload(invalid_preset)
+        invalid_preset_state = {
+            "mappings": [],
+            "presets": [dict(preset, condition_state="未知状态")],
+        }
+        with self.assertRaises(ValueError):
+            validate_config_payload(invalid_preset_state)
 
 
 class ConditionalKanataTests(unittest.TestCase):
@@ -86,6 +156,28 @@ class ConditionalKanataTests(unittest.TestCase):
             macro_pause_enabled=False,
         ).build()
         self.assertIn("(not (input real mlft))", text)
+
+    def test_conditional_preset_uses_same_state_switch_and_trigger_gate(self):
+        preset = {
+            "id": "p1",
+            "enabled": True,
+            "trigger_modifiers": "无",
+            "trigger": "F2",
+            "condition_enabled": True,
+            "condition_input": "鼠标左键",
+            "condition_state": "按住时",
+            "execution_mode": "执行一次",
+            "actions": [{
+                "type": "键盘点击", "modifiers": "无", "target": "Space",
+            }],
+        }
+        text = KanataConfigBuilder(
+            [], [preset], global_toggle_enabled=False,
+            macro_pause_enabled=False,
+        ).build()
+        self.assertIn("(input real mlft)", text)
+        self.assertIn("mc-trigger preset p1 down", text)
+        self.assertIn("push-msg mc-state mlft down", text)
 
 
 class _Controller:
@@ -158,8 +250,10 @@ class _ConflictHarness(TriggerConflictMixin):
     recording_finish_key = "F6"
     profiles = []
 
-    def __init__(self, mappings):
-        self.base_profile_payload = {"mappings": mappings, "presets": []}
+    def __init__(self, mappings, presets=None):
+        self.base_profile_payload = {
+            "mappings": mappings, "presets": list(presets or []),
+        }
 
     def _store_editor_payload(self):
         pass
@@ -200,6 +294,26 @@ class ConditionalConflictTests(unittest.TestCase):
             if item["severity"] == "error"
         ]
         self.assertTrue(errors)
+
+    def test_conditional_preset_can_share_trigger_with_mapping_fallback(self):
+        preset = {
+            "id": "p1",
+            "enabled": True,
+            "name": "conditional-preset",
+            "trigger_modifiers": "无",
+            "trigger": "鼠标右键",
+            "condition_enabled": True,
+            "condition_input": "鼠标左键",
+            "condition_state": "按住时",
+        }
+        harness = _ConflictHarness([
+            self._mapping("fallback", condition_enabled=False),
+        ], [preset])
+        errors = [
+            item for item in harness.analyze_trigger_conflicts()
+            if item["severity"] == "error"
+        ]
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

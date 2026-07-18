@@ -35,13 +35,16 @@ KEY_NAMES = {
     *(f"F{index}" for index in range(1, 25)),
 }
 INPUT_NAMES = MOUSE_NAMES | KEY_NAMES
-SOURCE_NAMES = INPUT_NAMES - {"Esc"}
+SOURCE_NAMES = set(INPUT_NAMES)
+CONDITION_INPUT_NAMES = set(INPUT_NAMES)
+SYSTEM_HOTKEY_NAMES = INPUT_NAMES - {"Esc"}
 MODIFIER_OPTIONS = {
     "无", "Ctrl", "Shift", "Alt", "Ctrl+Shift", "Ctrl+Alt", "Shift+Alt",
     "Ctrl+Shift+Alt",
 }
 ACTION_TYPES = {
     "键盘点击", "鼠标点击", "鼠标滚轮", "鼠标移动", "等待", "循环动作",
+    "调用子宏", "条件分支", "等待条件",
 }
 MAPPING_MODES = {
     "同步按住", "执行一次", "固定次数", "按住循环", "开关循环", "无限循环",
@@ -390,7 +393,8 @@ def _validate_mapping(mapping, index, seen_ids):
     _validate_hotkey(mapping, "target_modifiers", "target", path, INPUT_NAMES)
     if "condition_input" in mapping:
         _validate_choice(
-            mapping["condition_input"], path + ("condition_input",), SOURCE_NAMES
+            mapping["condition_input"], path + ("condition_input",),
+            CONDITION_INPUT_NAMES,
         )
     if mapping.get("condition_enabled"):
         if "condition_input" not in mapping:
@@ -495,6 +499,58 @@ def _validate_action(action, path, state, depth, require_runtime_fields=False):
                 _validate_int(action["wait_ms"], path + ("wait_ms",), 1, 600_000)
             if "jitter_ms" in action:
                 _validate_int(action["jitter_ms"], path + ("jitter_ms",), 0, 600_000)
+        elif action_type == "条件分支":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "condition_input", path)
+                _require_non_empty_field(action, "condition_state", path)
+            if "condition_input" in action:
+                _validate_choice(
+                    action["condition_input"], path + ("condition_input",),
+                    CONDITION_INPUT_NAMES,
+                )
+            if "condition_state" in action:
+                _validate_choice(
+                    action["condition_state"], path + ("condition_state",),
+                    MAPPING_CONDITION_STATES,
+                )
+        elif action_type == "等待条件":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "condition_input", path)
+                _require_non_empty_field(action, "condition_state", path)
+            if "condition_input" in action:
+                _validate_choice(
+                    action["condition_input"], path + ("condition_input",),
+                    CONDITION_INPUT_NAMES,
+                )
+            if "condition_state" in action:
+                _validate_choice(
+                    action["condition_state"], path + ("condition_state",),
+                    MAPPING_CONDITION_STATES,
+                )
+            _validate_optional_fields(action, {
+                "timeout_ms": lambda value: _validate_int(
+                    value, path + ("timeout_ms",), 0, 600_000
+                ),
+                "poll_ms": lambda value: _validate_int(
+                    value, path + ("poll_ms",), 10, 1_000
+                ),
+            })
+        elif action_type == "调用子宏":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "preset_id", path)
+            if "preset_id" in action:
+                _validate_string(
+                    action["preset_id"], path + ("preset_id",),
+                    allow_empty=not require_runtime_fields,
+                )
+            _validate_optional_fields(action, {
+                "repeat_count": lambda value: _validate_int(
+                    value, path + ("repeat_count",), 1, 100_000
+                ),
+                "speed_percent": lambda value: _validate_int(
+                    value, path + ("speed_percent",), 10, 500
+                ),
+            })
 
     for child_index, child in enumerate(children, 1):
         _validate_action(
@@ -664,6 +720,56 @@ def _validate_scope_sizes(mappings, presets, path, totals):
         raise ValueError(f"全部预设总数超过 {MAX_TOTAL_PRESETS}")
 
 
+def _validate_submacro_references(presets, path):
+    """Require same-scope targets and reject direct or indirect call cycles."""
+    preset_ids = {
+        str(preset.get("id")): preset
+        for preset in presets
+        if isinstance(preset, dict) and preset.get("id") not in (None, "")
+    }
+    graph = {preset_id: set() for preset_id in preset_ids}
+    for preset_id, preset in preset_ids.items():
+        stack = list(preset.get("actions", []) or [])
+        while stack:
+            action = stack.pop()
+            if not isinstance(action, dict):
+                continue
+            stack.extend(action.get("children", []) or [])
+            if action.get("type") != "调用子宏":
+                continue
+            target_id = str(action.get("preset_id") or "")
+            if not target_id:
+                continue
+            if target_id not in preset_ids:
+                raise ValueError(
+                    f"{_path_text(path)} 中的子宏调用指向了不存在的预设："
+                    f"{target_id}"
+                )
+            graph[preset_id].add(target_id)
+
+    visiting = set()
+    visited = set()
+
+    def visit(preset_id, chain):
+        if preset_id in visiting:
+            start = chain.index(preset_id) if preset_id in chain else 0
+            cycle = chain[start:] + [preset_id]
+            raise ValueError(
+                f"{_path_text(path)} 中的子宏调用形成循环："
+                + " -> ".join(cycle)
+            )
+        if preset_id in visited:
+            return
+        visiting.add(preset_id)
+        for target_id in graph.get(preset_id, ()):
+            visit(target_id, chain + [preset_id])
+        visiting.remove(preset_id)
+        visited.add(preset_id)
+
+    for preset_id in graph:
+        visit(preset_id, [])
+
+
 def validate_preset_payload(preset, index=1, _global_state=None, _path=None):
     path = _path or (f"预设 {index}",)
     _require_dict(preset, path)
@@ -676,12 +782,28 @@ def validate_preset_payload(preset, index=1, _global_state=None, _path=None):
         "loop_interval_jitter_ms": lambda value: _validate_int(value, path + ("loop_interval_jitter_ms",), 0, 600_000),
         "speed_percent": lambda value: _validate_int(value, path + ("speed_percent",), 10, 500),
         "max_runtime_s": lambda value: _validate_int(value, path + ("max_runtime_s",), 0, 86_400),
+        "condition_enabled": lambda value: _validate_bool(
+            value, path + ("condition_enabled",)
+        ),
+        "condition_state": lambda value: _validate_choice(
+            value, path + ("condition_state",), MAPPING_CONDITION_STATES
+        ),
     })
     preset_enabled = bool(preset.get("enabled", False))
     if preset_enabled:
         for required_field in ("trigger_modifiers", "trigger"):
             _require_non_empty_field(preset, required_field, path)
     _validate_hotkey(preset, "trigger_modifiers", "trigger", path, SOURCE_NAMES)
+    if "condition_input" in preset:
+        _validate_choice(
+            preset["condition_input"], path + ("condition_input",),
+            CONDITION_INPUT_NAMES,
+        )
+    if preset.get("condition_enabled"):
+        if "condition_input" not in preset:
+            raise ValueError(f"{_path_text(path + ('condition_input',))} 不能为空")
+        if "condition_state" not in preset:
+            raise ValueError(f"{_path_text(path + ('condition_state',))} 不能为空")
     actions = _require_list(preset.get("actions", []), path + ("actions",))
     if preset_enabled and not actions:
         raise ValueError(f"{_path_text(path + ('actions',))} 不能为空")
@@ -757,6 +879,7 @@ def _validate_profile(profile, index, seen_ids, totals):
                         "与同一档案中的其他预设重复"
                     )
                 preset_ids.add(preset_id)
+        _validate_submacro_references(presets, payload_path + ("presets",))
 
 
 def validate_config_payload(data, *, allow_profiles=True):
@@ -792,7 +915,8 @@ def validate_config_payload(data, *, allow_profiles=True):
         "recording_cancel", "recording_finish"
     ):
         _validate_hotkey(
-            data, f"{prefix}_modifiers", f"{prefix}_key", (prefix,), SOURCE_NAMES
+            data, f"{prefix}_modifiers", f"{prefix}_key", (prefix,),
+            SYSTEM_HOTKEY_NAMES,
         )
 
     mappings = _require_list(data.get("mappings", []), ("mappings",))
@@ -815,6 +939,7 @@ def validate_config_payload(data, *, allow_profiles=True):
             preset, index, _global_state=totals,
             _path=(f"预设 {index}",),
         )
+    _validate_submacro_references(presets, ("presets",))
 
     if allow_profiles:
         profiles = _require_list(data.get("profiles", []), ("profiles",))

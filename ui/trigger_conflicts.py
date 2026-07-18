@@ -87,10 +87,9 @@ class TriggerConflictMixin:
 
     @classmethod
     def _same_trigger_report(cls, entry, other, prefix=""):
-        if (
-            entry.get("rule_type") == "mapping"
-            and other.get("rule_type") == "mapping"
-        ):
+        if {
+            entry.get("rule_type"), other.get("rule_type")
+        } <= {"mapping", "preset"}:
             relation = cls._mapping_condition_conflict(entry, other)
             if relation is None:
                 return None
@@ -100,8 +99,8 @@ class TriggerConflictMixin:
                     "message": (
                         f"{prefix}{entry['label']} 与 {other['label']} 使用相同快捷键 "
                         f"{combo_text(entry['modifiers'], entry['key'])}，且两个条件可能同时成立；"
-                        "运行时只执行优先级最高的一条。优先级规则：条件映射优先，"
-                        "同级按映射列表顺序。"
+                            "运行时只执行优先级最高的一条。优先级规则：条件规则优先，"
+                            "同级按基础映射、预设列表顺序。"
                     ),
                 }
         return {
@@ -185,11 +184,14 @@ class TriggerConflictMixin:
                 ))
         for index, preset in enumerate(base_payload.get("presets", []), 1):
             if preset.get("enabled"):
+                label = preset.get("name") or f"预设 {index}"
+                condition_report = self._mapping_condition_report(preset, label)
+                if condition_report is not None:
+                    reports.append(condition_report)
                 entries.append(self._entry(
                     preset.get("trigger_modifiers", "无"),
                     preset["trigger"],
-                    preset.get("name") or f"预设 {index}",
-                    "runtime", "preset",
+                    label, "runtime", "preset", preset,
                 ))
 
         for index, entry in enumerate(entries):
@@ -305,11 +307,16 @@ class TriggerConflictMixin:
                     ))
             for index, preset in enumerate(payload.get("presets", []), 1):
                 if preset.get("enabled"):
+                    label = preset.get("name") or f"预设 {index}"
+                    condition_report = self._mapping_condition_report(
+                        preset, label, prefix=f"档案“{profile_name}”中 "
+                    )
+                    if condition_report is not None:
+                        reports.append(condition_report)
                     entries.append(self._entry(
                         preset.get("trigger_modifiers", "无"),
                         preset.get("trigger", "F1"),
-                        preset.get("name") or f"预设 {index}",
-                        "runtime", "preset",
+                        label, "runtime", "preset", preset,
                     ))
             for index, entry in enumerate(entries):
                 trigger = combo_text(entry["modifiers"], entry["key"])

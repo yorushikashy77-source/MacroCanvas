@@ -35,6 +35,12 @@ class ActionExecutionMixin:
         if preset is None:
             QMessageBox.warning(self, "无法预览", "当前预设内容无法读取。")
             return None
+        all_presets = self.collect_presets()
+        preset_library = {
+            str(item.get("id")): item
+            for item in all_presets if item.get("id")
+        }
+        preset["_preset_library"] = preset_library
         report = simulate_preset(preset)
         dialog = SimulationPreviewDialog(report, self)
         dialog.setStyleSheet(self.styleSheet())
@@ -339,6 +345,12 @@ class ActionExecutionMixin:
                 "max_runtime_s": 0,
                 "actions": actions,
             })
+            issue_checker = getattr(self, "_recorded_mouse_context_issue", None)
+            issue = issue_checker(preset["actions"]) if callable(issue_checker) else None
+            if issue is not None:
+                self._show_recorded_mouse_context_issue(preset, issue)
+                self.refresh_status_ui()
+                return
             preset["_required_profile_id"] = str(self.active_profile_id or "")
             if self.macro_controller.start(preset):
                 self.macro_state = MacroState.RUNNING
@@ -541,6 +553,19 @@ class ActionExecutionMixin:
             # pass, while fixed-count and ordinary one-shot modes keep their
             # configured execution semantics.
             test_task = self._build_menu_test_task(preset)
+            issue_checker = getattr(self, "_recorded_mouse_context_issue", None)
+            issue = (
+                issue_checker(test_task["actions"])
+                if callable(issue_checker) else None
+            )
+            if issue is not None:
+                self.macro_state = MacroState.IDLE
+                self.macro_status_detail = ""
+                if hasattr(self, "activity_overlay"):
+                    self.activity_overlay.hide_message()
+                self._show_recorded_mouse_context_issue(test_task, issue)
+                self.refresh_status_ui()
+                return
 
             started = bool(self.macro_controller.start(test_task))
             if started:

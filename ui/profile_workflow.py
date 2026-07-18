@@ -1081,8 +1081,14 @@ class ProfileWorkflowMixin:
                     preset.get("actions", [])
                 )
                 self.runtime_presets.append(copied)
+            runtime_library = {
+                str(preset.get("id")): preset
+                for preset in self.runtime_presets if preset.get("id")
+            }
+            for preset in self.runtime_presets:
+                preset["_preset_library"] = runtime_library
                 self.runtime_trigger_rules.append(
-                    self._preset_as_mapping_rule(copied)
+                    self._preset_as_mapping_rule(preset)
                 )
         return True
 

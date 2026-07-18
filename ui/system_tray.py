@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from config.storage import atomic_write_text
 from core.constants import APP_NAME, UI_SETTINGS_PATH
-from ui.operation_state import operation_blocks, operation_state_snapshot
+from ui.operation_state import operation_blocks
 
 
 class SystemTrayMixin:
@@ -229,13 +229,36 @@ class SystemTrayMixin:
         if getattr(self, "_shutdown_complete", False):
             return
         self._tray_exit_requested = True
-        if not self.isVisible():
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
         self.close()
-        if not getattr(self, "_shutdown_complete", False):
+        if getattr(self, "_shutdown_complete", False):
+            # The window is usually hidden while it lives in the tray. Qt only
+            # emits ``lastWindowClosed`` for a visible window, so relying on
+            # that signal leaves the QApplication (and its py.exe host) alive
+            # after a successful hidden-window tray exit.
+            self._quit_application_after_tray_exit()
+        else:
             self._tray_exit_requested = False
+
+    @staticmethod
+    def _quit_application_after_tray_exit():
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def show_tray_exit_blocked_notice(self, reason):
+        """Keep a tray-initiated shutdown silent unless user action is needed."""
+        text = str(reason or "安全退出尚未完成；程序仍在托盘中运行。")
+        tray = getattr(self, "system_tray", None)
+        if tray is not None and tray.isVisible():
+            tray.showMessage(
+                APP_NAME,
+                text + "\n点击托盘图标可打开主窗口处理。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                7000,
+            )
+        if hasattr(self, "engine_hint"):
+            self.engine_hint.setStyleSheet("color: #fbbf24;")
+            self.engine_hint.setText(text)
 
     def should_hide_close_to_tray(self):
         requires_visible_safety_flow = (

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections import Counter
 
+from core.constants import (
+    CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+)
 from macro.scheduler import LOOP_ACTION_TYPE, MacroTask
 
 
@@ -28,6 +31,11 @@ def _scaled_range(base, jitter, speed, minimum=0):
 
 def _action_own_duration(action, speed):
     kind = str(action.get("type") or "动作")
+    if kind in (CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE):
+        return 0, 0
+    if kind == WAIT_CONDITION_ACTION_TYPE:
+        timeout = _bounded_int(action.get("timeout_ms", 0), 0, 0, 600_000)
+        return 0, timeout or None
     if kind == "等待":
         return _scaled_range(
             action.get("wait_ms", 1), action.get("jitter_ms", 0), speed, 1
@@ -56,16 +64,65 @@ def _loop_controls(actions):
     return controls
 
 
-def _action_group_duration(action, speed):
+def _action_group_duration(action, speed, library=None, call_stack=()):
+    kind = str(action.get("type") or "动作")
+    if kind == SUBMACRO_ACTION_TYPE:
+        target_id = str(action.get("preset_id") or "")
+        target = (library or {}).get(target_id)
+        if not target or target_id in call_stack or len(call_stack) >= 16:
+            called_min = called_max = 0
+        else:
+            local_speed = _bounded_int(
+                action.get("speed_percent", 100), 100, 10, 500
+            )
+            effective_speed = max(
+                10, min(500, round(speed * local_speed / 100))
+            )
+            called_min, called_max = _sequence_duration(
+                target.get("actions", []), effective_speed,
+                library=library, call_stack=call_stack + (target_id,),
+            )
+            repeats = _bounded_int(
+                action.get("repeat_count", 1), 1, 1, 100_000
+            )
+            called_min *= repeats
+            called_max = None if called_max is None else called_max * repeats
+        child_min, child_max = _sequence_duration(
+            action.get("children", []) or [], speed,
+            library=library, call_stack=call_stack,
+        )
+        return (
+            called_min + child_min,
+            None if called_max is None or child_max is None
+            else called_max + child_max,
+        )
     own_min, own_max = _action_own_duration(action, speed)
     child_min, child_max = _sequence_duration(
-        action.get("children", []) or [], speed, timeline_mode="parallel"
+        action.get("children", []) or [], speed,
+        timeline_mode=(
+            "sequential" if kind in (
+                CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+            ) else "parallel"
+        ),
+        library=library, call_stack=call_stack,
     )
+    if kind == CONDITION_ACTION_TYPE:
+        return 0, child_max
+    if kind == WAIT_CONDITION_ACTION_TYPE:
+        return (
+            child_min,
+            None if own_max is None or child_max is None else own_max + child_max,
+        )
     return max(own_min, child_min), max(own_max, child_max)
 
 
-def _segment_duration(segment, speed, timeline_mode):
-    durations = [_action_group_duration(action, speed) for action in segment]
+def _segment_duration(
+    segment, speed, timeline_mode, library=None, call_stack=(),
+):
+    durations = [
+        _action_group_duration(action, speed, library, call_stack)
+        for action in segment
+    ]
     if not durations:
         return 0, 0
     if timeline_mode == "parallel":
@@ -73,10 +130,14 @@ def _segment_duration(segment, speed, timeline_mode):
     return sum(item[0] for item in durations), sum(item[1] for item in durations)
 
 
-def _loop_duration(control, segment, parent_speed, timeline_mode):
+def _loop_duration(
+    control, segment, parent_speed, timeline_mode, library=None, call_stack=(),
+):
     local_speed = _bounded_int(control.get("speed_percent", 100), 100, 10, 500)
     speed = max(10, min(500, round(parent_speed * local_speed / 100)))
-    cycle_min, cycle_max = _segment_duration(segment, speed, timeline_mode)
+    cycle_min, cycle_max = _segment_duration(
+        segment, speed, timeline_mode, library, call_stack
+    )
     mode = str(control.get("execution_mode") or "执行次数")
     if mode == "执行次数":
         cycles = _bounded_int(control.get("loop_count", 2), 2, 1, 100_000)
@@ -101,7 +162,9 @@ def _loop_duration(control, segment, parent_speed, timeline_mode):
     return cycle_min, maximum, True
 
 
-def _sequence_duration(actions, speed, timeline_mode="sequential"):
+def _sequence_duration(
+    actions, speed, timeline_mode="sequential", library=None, call_stack=(),
+):
     ordinary = [
         action for action in actions or []
         if action.get("type") != LOOP_ACTION_TYPE
@@ -122,11 +185,14 @@ def _sequence_duration(actions, speed, timeline_mode="sequential"):
             loop_min, loop_max, _infinite = _loop_duration(
                 matched[0], matched[1], speed,
                 str(matched[0].get("timeline_mode") or timeline_mode),
+                library, call_stack,
             )
             values.append((loop_min, loop_max))
             index += len(matched[1])
         else:
-            values.append(_action_group_duration(action, speed))
+            values.append(_action_group_duration(
+                action, speed, library, call_stack
+            ))
             index += 1
     if not values:
         return 0, 0
@@ -142,7 +208,7 @@ def _sequence_duration(actions, speed, timeline_mode="sequential"):
 
 def _timeline_events(
     actions, speed, events, warnings, path=(), max_events=500,
-    base_min=0, base_max=0,
+    base_min=0, base_max=0, library=None, call_stack=(),
 ):
     ordinary = [
         action for action in actions or []
@@ -170,6 +236,7 @@ def _timeline_events(
             loop_min, loop_max, infinite = _loop_duration(
                 control, segment, speed,
                 str(control.get("timeline_mode") or "sequential"),
+                library, call_stack,
             )
             events.append({
                 "path": ".".join(map(str, path + (index + 1,))),
@@ -190,6 +257,7 @@ def _timeline_events(
                 segment, effective_speed, events, warnings,
                 path + (index + 1,), max_events,
                 base_min=cursor_min, base_max=cursor_max,
+                library=library, call_stack=call_stack,
             )
             if infinite:
                 warnings.append(
@@ -203,7 +271,9 @@ def _timeline_events(
             index += len(segment)
             continue
 
-        own_min, own_max = _action_group_duration(action, speed)
+        own_min, own_max = _action_group_duration(
+            action, speed, library, call_stack
+        )
         events.append({
             "path": ".".join(map(str, path + (index + 1,))),
             "start_min_ms": cursor_min,
@@ -218,7 +288,16 @@ def _timeline_events(
                 action.get("children", []), speed, events, warnings,
                 path + (index + 1,), max_events,
                 base_min=cursor_min, base_max=cursor_max,
+                library=library, call_stack=call_stack,
             )
+        if action.get("type") in (CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE):
+            warnings.append(
+                f"{MacroTask.describe(action)} 依赖预览时无法确定的实时输入状态。"
+            )
+        if action.get("type") == SUBMACRO_ACTION_TYPE:
+            target_id = str(action.get("preset_id") or "")
+            if target_id not in (library or {}):
+                warnings.append(f"子宏目标 {target_id or '未设置'} 不存在。")
         cursor_min += own_min
         cursor_max = cursor_max + own_max if cursor_max is not None else None
         index += 1
@@ -228,7 +307,13 @@ def simulate_preset(preset, max_events=500):
     """Return a bounded preview without starting an engine or sending input."""
     actions = list(preset.get("actions", []) or [])
     speed = _bounded_int(preset.get("speed_percent", 100), 100, 10, 500)
-    one_min, one_max = _sequence_duration(actions, speed)
+    library = preset.get("_preset_library", {})
+    if not isinstance(library, dict):
+        library = {}
+    call_stack = (str(preset.get("id") or ""),)
+    one_min, one_max = _sequence_duration(
+        actions, speed, library=library, call_stack=call_stack
+    )
     mode = str(preset.get("execution_mode") or "执行一次")
     warnings = []
     if mode == "固定次数":
@@ -263,7 +348,10 @@ def simulate_preset(preset, max_events=500):
         )
 
     events = []
-    _timeline_events(actions, speed, events, warnings, max_events=max_events)
+    _timeline_events(
+        actions, speed, events, warnings, max_events=max_events,
+        library=library, call_stack=call_stack,
+    )
     action_types = Counter()
     stack = list(actions)
     while stack:

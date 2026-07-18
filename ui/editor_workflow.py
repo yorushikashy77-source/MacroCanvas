@@ -38,6 +38,53 @@ ACTION_LEGACY_MODIFIERS_ROLE = ACTION_RECORDING_CONTEXT_ROLE + 1
 
 
 class EditorWorkflowMixin:
+    def _submacro_preset_options(self, card=None):
+        return [
+            (str(other.preset_id), other.name.text().strip() or "未命名预设")
+            for other in getattr(self, "preset_cards", [])
+            if other is not card and str(getattr(other, "preset_id", "") or "")
+        ]
+
+    def _default_submacro_target(self, card=None):
+        options = self._submacro_preset_options(card)
+        return options[0][0] if options else ""
+
+    def add_submacro_action_from_menu(self, card=None):
+        target_id = self._default_submacro_target(card)
+        if not target_id:
+            QMessageBox.information(
+                getattr(card, "action_dialog", None) or self,
+                "暂无可调用的子宏",
+                "请先在当前配置方案中再添加一个预设，"
+                "然后返回此处添加“调用子宏”动作。",
+            )
+            return None
+        return self.add_action_from_menu({
+            "type": SUBMACRO_ACTION_TYPE,
+            "preset_id": target_id,
+            "repeat_count": 1,
+            "speed_percent": 100,
+            "children": [],
+        }, card=card)
+
+    def refresh_submacro_target_editors(self, card):
+        if card is None or not getattr(card, "_actions_loaded", False):
+            return
+        options = self._submacro_preset_options(card)
+        table = card.action_table
+        for item in table.iter_items():
+            if self.is_loop_action_item(item):
+                continue
+            kind = table.itemWidget(item, 1)
+            target = table.itemWidget(item, 2)
+            if (
+                kind is not None and target is not None
+                and kind.currentText() == SUBMACRO_ACTION_TYPE
+            ):
+                target.set_submacro_options(
+                    options, target.currentText(), emit=False
+                )
+
     @staticmethod
     def labeled_control(title, control, stretch=0):
         holder = QWidget()
@@ -783,7 +830,13 @@ class EditorWorkflowMixin:
         else:
             kind = self.combo(ACTION_TYPES, action.get("type", "键盘点击"), changed)
             target = ActionTargetEditor(
-                action.get("type", "键盘点击"), action.get("target", "A")
+                action.get("type", "键盘点击"),
+                (
+                    action.get("preset_id", "")
+                    if action.get("type") == SUBMACRO_ACTION_TYPE
+                    else action.get("condition_input", action.get("target", "A"))
+                ),
+                preset_options=self._submacro_preset_options(card),
             )
             if legacy_modifiers != "无":
                 target.setToolTip(
@@ -802,7 +855,11 @@ class EditorWorkflowMixin:
                 notify=False, card=card,
             )
 
-            if action.get("type") == "等待":
+            if action.get("type") == WAIT_CONDITION_ACTION_TYPE:
+                duration_value = int(action.get("timeout_ms", 0))
+            elif action.get("type") == SUBMACRO_ACTION_TYPE:
+                duration_value = int(action.get("repeat_count", 1))
+            elif action.get("type") == "等待":
                 duration_value = int(action.get("wait_ms", action.get("delay_ms", 500)))
             elif action.get("type") == "鼠标滚轮":
                 duration_value = int(action.get("steps", 1))
@@ -812,6 +869,16 @@ class EditorWorkflowMixin:
                 action.get("type", "键盘点击"), duration_value,
                 int(action.get("jitter_ms", 0)),
             )
+            if action.get("type") in (
+                CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+            ):
+                duration.setConditionState(
+                    action.get("condition_state", "按住时"), emit=False
+                )
+            if action.get("type") == SUBMACRO_ACTION_TYPE:
+                duration.setCallSpeedValue(
+                    action.get("speed_percent", 100), emit=False
+                )
             if action.get("type") == "鼠标移动":
                 duration.setMoveText(target.moveCoordinate(), emit=False)
                 duration.setMoveMode(target.moveModeText())
@@ -1216,7 +1283,25 @@ class EditorWorkflowMixin:
         }
         stored_recording = item.data(0, ACTION_RECORDING_CONTEXT_ROLE)
         duration = table.itemWidget(item, 3)
-        if action_type == "等待":
+        if action_type == CONDITION_ACTION_TYPE:
+            action.update({
+                "condition_input": table.itemWidget(item, 2).currentText(),
+                "condition_state": duration.conditionState(),
+            })
+        elif action_type == WAIT_CONDITION_ACTION_TYPE:
+            action.update({
+                "condition_input": table.itemWidget(item, 2).currentText(),
+                "condition_state": duration.conditionState(),
+                "timeout_ms": duration.value(),
+                "poll_ms": 20,
+            })
+        elif action_type == SUBMACRO_ACTION_TYPE:
+            action.update({
+                "preset_id": table.itemWidget(item, 2).currentText(),
+                "repeat_count": duration.value(),
+                "speed_percent": duration.callSpeedValue(),
+            })
+        elif action_type == "等待":
             action["wait_ms"] = duration.value()
             action["jitter_ms"] = duration.jitterValue()
         elif action_type == "鼠标滚轮":
@@ -1770,6 +1855,9 @@ class EditorWorkflowMixin:
         result = []
         for index, card in enumerate(self.preset_cards):
             trigger_modifiers, trigger = card.trigger_hotkey.value()
+            condition_enabled, condition_input, condition_state = (
+                card.trigger_hotkey.condition_value()
+            )
             mode = card.execution_mode.currentText()
             result.append({
                 "id": card.preset_id,
@@ -1777,6 +1865,9 @@ class EditorWorkflowMixin:
                 "name": card.name.text().strip() or f"预设 {index + 1}",
                 "trigger_modifiers": trigger_modifiers,
                 "trigger": trigger,
+                "condition_enabled": condition_enabled,
+                "condition_input": condition_input,
+                "condition_state": condition_state,
                 "execution_mode": mode,
                 "loop_count": card.loop_count.value() if mode == "固定次数" else 1,
                 "loop_interval_ms": (

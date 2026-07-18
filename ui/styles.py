@@ -25,7 +25,6 @@ QMenu {
 }
 QMenu::item { padding: 8px 24px; border-radius: 5px; }
 QMenu::item:selected { background: #7357f6; color: white; }
-QLabel#title { font-size: 29px; font-weight: 700; color: #f6f8fc; }
 QLabel#heading { font-size: 17px; font-weight: 650; color: #f2f5fa; }
 QLabel#sectionLabel { font-size: 15px; font-weight: 650; color: #dfe6f1; }
 QLabel#muted { color: #8491a3; font-size: 13px; }

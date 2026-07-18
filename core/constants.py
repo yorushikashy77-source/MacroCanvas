@@ -79,13 +79,26 @@ KEY_NAMES = (
     + [f"F{i}" for i in range(1, 25)]
 )
 INPUT_NAMES = MOUSE_NAMES + KEY_NAMES
-SOURCE_NAMES = [name for name in INPUT_NAMES if name != "Esc"]
-TRIGGER_NAMES = [name for name in INPUT_NAMES if name != "Esc"]
+SOURCE_NAMES = list(INPUT_NAMES)
+# 条件只读取物理输入状态，不会单独触发或吞掉该按键，
+# 因此可以安全使用 Esc 等普通触发源列表中的保留键。
+CONDITION_INPUT_NAMES = list(INPUT_NAMES)
+TRIGGER_NAMES = list(INPUT_NAMES)
 GLOBAL_TOGGLE_KEYS = [
-    name for name in SOURCE_NAMES if name not in ("Ctrl", "Shift", "Alt")
+    name for name in SOURCE_NAMES
+    if name not in ("Ctrl", "Shift", "Alt", "Esc")
 ]
 SYSTEM_HOTKEY_KEYS = [name for name in INPUT_NAMES if name != "Esc"]
-ACTION_TYPES = ["键盘点击", "鼠标点击", "鼠标滚轮", "鼠标移动", "等待"]
+SUBMACRO_ACTION_TYPE = "调用子宏"
+CONDITION_ACTION_TYPE = "条件分支"
+WAIT_CONDITION_ACTION_TYPE = "等待条件"
+CONTROL_ACTION_TYPES = {
+    SUBMACRO_ACTION_TYPE, CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+}
+ACTION_TYPES = [
+    "键盘点击", "鼠标点击", "鼠标滚轮", "鼠标移动", "等待",
+    CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE,
+]
 LOOP_ACTION_TYPE = "循环动作"
 LOOP_DATA_ROLE = int(Qt.ItemDataRole.UserRole)
 LOOP_TYPE_ROLE = LOOP_DATA_ROLE + 1
@@ -128,4 +141,3 @@ class MacroState(Enum):
     RECORDING = "录制中"
     STOPPING = "正在停止"
     STOP_TIMEOUT = "停止超时"
-

@@ -52,7 +52,9 @@ class HotkeyEdit(QWidget):
         self.modifiers = (modifiers or "无") if self.allow_modifiers else "无"
         self.key = key
         self.options = list(options or INPUT_NAMES)
-        self.condition_options = list(condition_options or SOURCE_NAMES)
+        self.condition_options = list(
+            condition_options or CONDITION_INPUT_NAMES
+        )
         self.condition_enabled = bool(condition_enabled) if self.allow_condition else False
         self.condition_key = self._normalized_condition_key(condition_key)
         self.condition_state = self._normalized_condition_state(condition_state)
@@ -513,7 +515,10 @@ class ActionTargetEditor(QWidget):
 
     changed = Signal()
 
-    def __init__(self, action_type="键盘点击", target="A", parent=None):
+    def __init__(
+        self, action_type="键盘点击", target="A", parent=None,
+        preset_options=None,
+    ):
         super().__init__(parent)
         self.action_type = action_type
         self._updating = False
@@ -545,16 +550,28 @@ class ActionTargetEditor(QWidget):
         self.wait_label = QLabel("—")
         self.wait_label.setAlignment(Qt.AlignCenter)
         self.wait_label.setObjectName("muted")
+        self.condition_editor = HotkeyEdit(
+            "无",
+            target if target in CONDITION_INPUT_NAMES else "鼠标左键",
+            CONDITION_INPUT_NAMES,
+            allow_modifiers=False,
+        )
+        self.submacro_editor = QComboBox()
 
         self.stack.addWidget(self.key_editor)
         self.stack.addWidget(self.wheel_editor)
         self.stack.addWidget(self.move_holder)
         self.stack.addWidget(self.wait_label)
+        self.stack.addWidget(self.condition_editor)
+        self.stack.addWidget(self.submacro_editor)
         layout.addWidget(self.stack)
 
         self.key_editor.changed.connect(self._emit_changed)
         self.wheel_editor.currentTextChanged.connect(self._emit_changed)
         self.move_mode.currentTextChanged.connect(self._emit_changed)
+        self.condition_editor.changed.connect(self._emit_changed)
+        self.submacro_editor.currentIndexChanged.connect(self._emit_changed)
+        self.set_submacro_options(preset_options or [], target, emit=False)
         self.set_action_type(action_type, target, emit=False)
 
     def _emit_changed(self, *_args):
@@ -574,7 +591,30 @@ class ActionTargetEditor(QWidget):
                 "前台客户区": "client:",
             }[self.move_mode.currentText()]
             return prefix + value
+        if self.action_type in (CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE):
+            return self.condition_editor.currentText()
+        if self.action_type == SUBMACRO_ACTION_TYPE:
+            return str(self.submacro_editor.currentData() or "")
         return "仅等待"
+
+    def set_submacro_options(self, options, preferred=None, emit=True):
+        """Refresh reusable-preset choices while preserving the stable ID."""
+        current = str(preferred or "")
+        previous = self.submacro_editor.blockSignals(True)
+        try:
+            if not current and self.action_type == SUBMACRO_ACTION_TYPE:
+                current = str(self.submacro_editor.currentData() or "")
+            self.submacro_editor.clear()
+            for preset_id, name in options or []:
+                preset_id = str(preset_id or "")
+                if preset_id:
+                    self.submacro_editor.addItem(str(name or preset_id), preset_id)
+            index = self.submacro_editor.findData(current)
+            self.submacro_editor.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            self.submacro_editor.blockSignals(previous)
+        if emit:
+            self.changed.emit()
 
     def moveCoordinate(self):
         return self.move_editor.text().strip() or "0,0"
@@ -627,6 +667,18 @@ class ActionTargetEditor(QWidget):
                 self.move_mode.setCurrentText(selected)
                 self.setMoveCoordinate(text, emit=False)
                 self.stack.setCurrentWidget(self.move_holder)
+            elif action_type in (CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE):
+                self.condition_editor.set_options(
+                    CONDITION_INPUT_NAMES,
+                    old if old in CONDITION_INPUT_NAMES else "鼠标左键",
+                    emit=False,
+                )
+                self.stack.setCurrentWidget(self.condition_editor)
+            elif action_type == SUBMACRO_ACTION_TYPE:
+                index = self.submacro_editor.findData(str(old or ""))
+                if index >= 0:
+                    self.submacro_editor.setCurrentIndex(index)
+                self.stack.setCurrentWidget(self.submacro_editor)
             else:
                 self.stack.setCurrentWidget(self.wait_label)
         finally:
@@ -670,11 +722,20 @@ class ActionDurationEditor(QWidget):
         # 固定宽度同时避免高 DPI 下再次退化成过窄输入框。
         self.move_editor.setFixedWidth(220)
         self.move_editor.setToolTip("输入鼠标坐标，例如 1920,1080")
+        self.condition_state = QComboBox()
+        self.condition_state.addItems(MAPPING_CONDITION_STATES)
+        self.call_speed = QSpinBox()
+        self.call_speed.setRange(10, 500)
+        self.call_speed.setSuffix(" % 速度")
+        self.call_speed.setValue(100)
+        self.call_speed.setFixedWidth(180)
 
         layout.addWidget(self.base)
         layout.addWidget(self.random_label)
         layout.addWidget(self.random)
         layout.addWidget(self.move_editor)
+        layout.addWidget(self.condition_state)
+        layout.addWidget(self.call_speed)
         layout.addStretch(1)
 
         # QSpinBox.valueChanged emits the new integer value, while this
@@ -683,6 +744,8 @@ class ActionDurationEditor(QWidget):
         self.base.valueChanged.connect(lambda _value: self.changed.emit())
         self.random.valueChanged.connect(lambda _value: self.changed.emit())
         self.move_editor.textChanged.connect(lambda _text: self.changed.emit())
+        self.condition_state.currentTextChanged.connect(lambda _text: self.changed.emit())
+        self.call_speed.valueChanged.connect(lambda _value: self.changed.emit())
         self.random.setValue(max(0, int(jitter_ms)))
         self.set_action_type(action_type, int(value), emit=False)
 
@@ -698,6 +761,28 @@ class ActionDurationEditor(QWidget):
 
     def moveText(self):
         return self.move_editor.text().strip() or "0,0"
+
+    def conditionState(self):
+        return self.condition_state.currentText()
+
+    def callSpeedValue(self):
+        return self.call_speed.value()
+
+    def setConditionState(self, state, emit=False):
+        previous = self.condition_state.blockSignals(not emit)
+        try:
+            self.condition_state.setCurrentText(
+                state if state in MAPPING_CONDITION_STATES else "按住时"
+            )
+        finally:
+            self.condition_state.blockSignals(previous)
+
+    def setCallSpeedValue(self, value, emit=False):
+        previous = self.call_speed.blockSignals(not emit)
+        try:
+            self.call_speed.setValue(max(10, min(500, int(value))))
+        finally:
+            self.call_speed.blockSignals(previous)
 
     def setMoveText(self, text, emit=True):
         value = str(text or "0,0").strip()
@@ -727,10 +812,23 @@ class ActionDurationEditor(QWidget):
         timed = action_type in ("键盘点击", "鼠标点击", "等待")
         self.random_label.setVisible(timed)
         self.random.setVisible(timed)
-        self.base.setVisible(action_type != "鼠标移动")
+        self.base.setVisible(action_type not in ("鼠标移动", CONDITION_ACTION_TYPE))
         self.move_editor.setVisible(action_type == "鼠标移动")
+        self.condition_state.setVisible(
+            action_type in (CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE)
+        )
+        self.call_speed.setVisible(action_type == SUBMACRO_ACTION_TYPE)
 
-        if action_type == "等待":
+        if action_type == WAIT_CONDITION_ACTION_TYPE:
+            self.base.setToolTip("超时时间；0 表示一直等待")
+            self.base.setRange(0, 600_000)
+            self.base.setSuffix(" ms 超时")
+            self.base.setSpecialValueText("一直等待")
+        elif action_type == SUBMACRO_ACTION_TYPE:
+            self.base.setToolTip("子宏重复次数")
+            self.base.setRange(1, 100_000)
+            self.base.setSuffix(" 次")
+        elif action_type == "等待":
             self.base.setToolTip("等待持续时间")
             self.base.setRange(1, 600_000)
             self.base.setSuffix(" ms")
@@ -907,6 +1005,7 @@ class ActionTreeWidget(QTreeWidget):
         self._drag_wheel_pixel_remainder = 0.0
         self._overlay = ActionTreeOverlay(self)
         self._item_widget_filter_targets = weakref.WeakSet()
+        self._item_widget_owners = weakref.WeakKeyDictionary()
         self.viewport().installEventFilter(self)
         # setItemWidget 的永久编辑控件在部分 Windows/Qt 组合下会把单纯的
         # 鼠标悬停误判成“切换当前行”。保存一次完整悬停会话的选择快照，
@@ -963,12 +1062,17 @@ class ActionTreeWidget(QTreeWidget):
         if event_type == QEvent.ChildAdded:
             child = event.child()
             if isinstance(child, QWidget):
-                self._install_item_widget_event_filters(child)
+                self._install_item_widget_event_filters(
+                    child, self._item_widget_owners.get(watched)
+                )
 
         if event_type == QEvent.MouseButtonPress:
-            # 点击控件属于主动操作。点击后的当前行变化保持原行为，不能再用
-            # 悬停前的快照把它回滚。
+            # 行内编辑器属于其所在动作。QComboBox 弹出列表时，
+            # Windows/Qt 有时会让 ExtendedSelection 保留甚至扩大旧选择。
+            # 在控件处理按下前明确单选归属行，不影响层级列的
+            # Ctrl/Shift 多选和拖拽。
             self._clear_item_widget_hover_guard()
+            self._select_item_widget_owner(watched)
         elif (
             self._is_passive_item_widget_event(event)
             and QApplication.mouseButtons() == Qt.MouseButton.NoButton
@@ -982,12 +1086,29 @@ class ActionTreeWidget(QTreeWidget):
 
         return super().eventFilter(watched, event)
 
-    def _install_item_widget_event_filters(self, widget):
+    def _install_item_widget_event_filters(self, widget, owner=None):
         self._item_widget_filter_targets.add(widget)
+        if owner is not None:
+            self._item_widget_owners[widget] = owner
         widget.installEventFilter(self)
         for child in widget.findChildren(QWidget):
             self._item_widget_filter_targets.add(child)
+            if owner is not None:
+                self._item_widget_owners[child] = owner
             child.installEventFilter(self)
+
+    def _select_item_widget_owner(self, watched):
+        owner = self._item_widget_owners.get(watched)
+        if owner is None or not any(
+            item is owner for item in self.iter_items()
+        ):
+            return
+        if self.selectedItems() == [owner] and self.currentItem() is owner:
+            return
+        self.setCurrentItem(
+            owner, 0,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect,
+        )
 
     def _begin_item_widget_hover_guard(self):
         self._item_widget_hover_generation += 1
@@ -1192,7 +1313,7 @@ class ActionTreeWidget(QTreeWidget):
         super().setItemWidget(item, column, widget)
         # 监听顶层单元格控件及其全部子控件。复合编辑器内部的箭头按钮、
         # spinbox lineEdit 等也必须受到同一选择保护。
-        self._install_item_widget_event_filters(widget)
+        self._install_item_widget_event_filters(widget, item)
         # setItemWidget creates viewport children after the overlay.  Raise the
         # overlay again so row outlines and insertion lines remain uninterrupted.
         QTimer.singleShot(0, self._refresh_overlay)
