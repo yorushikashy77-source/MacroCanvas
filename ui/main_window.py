@@ -2288,7 +2288,9 @@ class MainWindow(
             valid_ids = {
                 str(action.get("action_id"))
                 for action in iter_action_tree(ordinary)
-                if action.get("type") != LOOP_ACTION_TYPE and action.get("action_id")
+                if action.get("type") not in (
+                    LOOP_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+                ) and action.get("action_id")
             }
             for loop in deferred_loops:
                 loop["target_action_ids"] = [

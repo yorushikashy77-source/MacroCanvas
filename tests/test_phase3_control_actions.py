@@ -1,17 +1,23 @@
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
+from config.profiles import profile_summary
 from config.schema import validate_config_payload
 from core.constants import (
     GLOBAL_TOGGLE_KEYS, SOURCE_NAMES, SYSTEM_HOTKEY_KEYS, TRIGGER_NAMES,
 )
 from engine.kanata import KanataConfigBuilder
 from macro.scheduler import MacroTask
+from macro.recording import simplify_recorded_actions
 from macro.simulation import simulate_preset
 from ui.editors import ActionDurationEditor, ActionTargetEditor, HotkeyEdit
+from ui.editors import ActionTreeWidget
+from ui.editor_workflow import EditorWorkflowMixin
 
 
 class _Signal:
@@ -45,6 +51,46 @@ def _preset(preset_id, actions, enabled=True):
 
 
 class Phase3SchemaTests(unittest.TestCase):
+    def test_explicit_true_and_else_branches_are_validated(self):
+        condition = {
+            "action_id": "condition",
+            "type": "条件分支",
+            "condition_input": "A",
+            "condition_state": "按住时",
+            "children": [
+                {
+                    "action_id": "true-branch",
+                    "type": "条件成立分支",
+                    "children": [{
+                        "action_id": "true-action", "type": "等待",
+                        "wait_ms": 10,
+                    }],
+                },
+                {
+                    "action_id": "else-branch",
+                    "type": "否则分支",
+                    "children": [{
+                        "action_id": "else-action", "type": "等待",
+                        "wait_ms": 20,
+                    }],
+                },
+            ],
+        }
+        payload = {"presets": [_preset("root", [condition])]}
+        self.assertIs(validate_config_payload(payload), payload)
+
+        missing_else = {"presets": [_preset(
+            "root", [dict(condition, children=condition["children"][:1])]
+        )]}
+        with self.assertRaisesRegex(ValueError, "必须各包含"):
+            validate_config_payload(missing_else)
+
+        top_level_branch = {"presets": [_preset("root", [
+            condition["children"][0]
+        ])]}
+        with self.assertRaisesRegex(ValueError, "直接子项"):
+            validate_config_payload(top_level_branch)
+
     def test_valid_submacro_and_conditions(self):
         payload = {
             "presets": [
@@ -126,6 +172,29 @@ class Phase3RuntimeTests(unittest.TestCase):
         self.assertTrue(task.run_action_group(action, 100))
         self.assertEqual(sent, [("B", "Press"), ("B", "Release")])
 
+    def test_explicit_else_branch_executes_only_selected_path(self):
+        action = {
+            "type": "条件分支", "condition_input": "A",
+            "condition_state": "按住时",
+            "children": [
+                {"type": "条件成立分支", "children": [{
+                    "type": "键盘点击", "target": "B", "hold_ms": 1,
+                }]},
+                {"type": "否则分支", "children": [{
+                    "type": "键盘点击", "target": "C", "hold_ms": 1,
+                }]},
+            ],
+        }
+        task, sent = self.make_task({"id": "root", "name": "root"})
+        self.assertTrue(task.run_action_group(action, 100))
+        self.assertEqual(sent, [("C", "Press"), ("C", "Release")])
+
+        task, sent = self.make_task(
+            {"id": "root", "name": "root"}, lambda *_args: True
+        )
+        self.assertTrue(task.run_action_group(action, 100))
+        self.assertEqual(sent, [("B", "Press"), ("B", "Release")])
+
     def test_wait_condition_unblocks_and_times_out(self):
         held = threading.Event()
         task, _sent = self.make_task(
@@ -182,6 +251,89 @@ class Phase3SimulationTests(unittest.TestCase):
         self.assertEqual(report["one_cycle_max_ms"], 130)
         self.assertTrue(any("实时输入状态" in item for item in report["warnings"]))
 
+    def test_explicit_branch_preview_uses_shorter_and_longer_paths(self):
+        report = simulate_preset(_preset("root", [{
+            "action_id": "condition", "type": "条件分支",
+            "condition_input": "A", "condition_state": "按住时",
+            "children": [
+                {"action_id": "true", "type": "条件成立分支", "children": [
+                    {"action_id": "t", "type": "等待", "wait_ms": 20},
+                ]},
+                {"action_id": "else", "type": "否则分支", "children": [
+                    {"action_id": "e", "type": "等待", "wait_ms": 40},
+                ]},
+            ],
+        }]))
+        self.assertEqual(report["one_cycle_min_ms"], 20)
+        self.assertEqual(report["one_cycle_max_ms"], 40)
+
+    def test_branch_containers_are_not_counted_as_actions_or_outputs(self):
+        condition = {
+            "type": "条件分支", "condition_input": "A",
+            "condition_state": "按住时", "children": [
+                {"type": "条件成立分支", "children": [
+                    {"type": "等待", "wait_ms": 20},
+                ]},
+                {"type": "否则分支", "children": [
+                    {"type": "键盘点击", "target": "B", "hold_ms": 20},
+                ]},
+            ],
+        }
+        summary = profile_summary({
+            "payload": {"mappings": [], "presets": [
+                _preset("root", [condition], enabled=False),
+            ]},
+        })
+        self.assertEqual(summary["actions"], 3)
+        self.assertEqual(summary["virtual_keys"], 1)
+
+    def test_action_cleanup_does_not_add_timing_to_branch_controls(self):
+        actions = [{
+            "type": "条件分支", "children": [
+                {"type": "条件成立分支", "children": [
+                    {"type": "等待", "wait_ms": 20},
+                ]},
+                {"type": "否则分支", "children": []},
+            ],
+        }]
+        cleaned = simplify_recorded_actions(
+            actions, trim_edge_waits=False, adjust_timing=True,
+        )
+        self.assertNotIn("hold_ms", cleaned[0])
+        self.assertNotIn("hold_ms", cleaned[0]["children"][0])
+        self.assertNotIn("hold_ms", cleaned[0]["children"][1])
+
+
+class _EditorHarness(EditorWorkflowMixin):
+    def __init__(self):
+        self.selected_preset_card = None
+        self.preset_cards = []
+        self.loading_task_stack = []
+        self.initializing = False
+
+    def select_preset_card(self, card):
+        self.selected_preset_card = card
+
+    def update_card_action_summary(self, _card):
+        pass
+
+    def _loading_checkpoint(self, *_args, **_kwargs):
+        pass
+
+    def action_changed(self, _card=None):
+        pass
+
+
+def _action_card():
+    table = ActionTreeWidget()
+    table.setColumnCount(5)
+    return SimpleNamespace(
+        action_table=table,
+        action_title=QLabel(),
+        loop_points_button=QPushButton(),
+        _actions_loaded=True,
+    )
+
 
 class Phase3EditorTests(unittest.TestCase):
     @classmethod
@@ -207,6 +359,73 @@ class Phase3EditorTests(unittest.TestCase):
         duration.setConditionState("松开时")
         self.assertEqual(duration.value(), 0)
         self.assertEqual(duration.conditionState(), "松开时")
+
+    def test_legacy_condition_is_rendered_with_two_fixed_branches(self):
+        harness = _EditorHarness()
+        card = _action_card()
+        harness.preset_cards.append(card)
+        item = harness.add_action({
+            "action_id": "condition",
+            "type": "条件分支",
+            "condition_input": "A",
+            "condition_state": "按住时",
+            "children": [{
+                "action_id": "legacy", "type": "等待", "wait_ms": 10,
+            }],
+        }, save=False, card=card)
+
+        self.assertEqual(item.childCount(), 2)
+        true_branch, else_branch = item.child(0), item.child(1)
+        self.assertTrue(harness.is_condition_branch_item(true_branch))
+        self.assertTrue(harness.is_condition_branch_item(else_branch))
+        self.assertEqual(true_branch.childCount(), 1)
+        self.assertEqual(else_branch.childCount(), 0)
+        self.assertFalse(
+            bool(true_branch.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        )
+        self.assertIsInstance(card.action_table.itemWidget(true_branch, 4), QLabel)
+
+        harness.add_action({
+            "action_id": "else-wait", "type": "等待", "wait_ms": 25,
+        }, save=False, card=card, parent_item=else_branch)
+        rebuilt = harness.action_from_item(card.action_table, item)
+        self.assertEqual(
+            [child["type"] for child in rebuilt["children"]],
+            ["条件成立分支", "否则分支"],
+        )
+        self.assertEqual(len(rebuilt["children"][1]["children"]), 1)
+
+    def test_changing_action_type_wraps_and_unwraps_existing_children(self):
+        harness = _EditorHarness()
+        card = _action_card()
+        harness.preset_cards.append(card)
+        item = harness.add_action({
+            "action_id": "parent", "type": "键盘点击", "target": "A",
+            "hold_ms": 10, "children": [{
+                "action_id": "child", "type": "等待", "wait_ms": 15,
+            }],
+        }, save=False, card=card)
+
+        card.action_table.itemWidget(item, 1).setCurrentText("条件分支")
+        QApplication.processEvents()
+        condition_item = card.action_table.topLevelItem(0)
+        self.assertEqual(condition_item.childCount(), 2)
+        self.assertEqual(condition_item.child(0).childCount(), 1)
+        self.assertEqual(
+            harness.action_from_item(card.action_table, condition_item)
+            ["children"][0]["children"][0]["action_id"],
+            "child",
+        )
+
+        card.action_table.itemWidget(condition_item, 1).setCurrentText("等待")
+        QApplication.processEvents()
+        wait_item = card.action_table.topLevelItem(0)
+        self.assertEqual(wait_item.childCount(), 1)
+        self.assertEqual(
+            harness.action_from_item(card.action_table, wait_item)
+            ["children"][0]["action_id"],
+            "child",
+        )
 
     def test_escape_is_manual_source_option_but_not_system_hotkey(self):
         self.assertIn("Esc", SOURCE_NAMES)

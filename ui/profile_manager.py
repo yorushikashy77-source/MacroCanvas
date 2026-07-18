@@ -325,12 +325,18 @@ class ProfileManagerDialog(QDialog):
         }
         action_total = 0
         action_outputs = 0
+        branch_types = {"条件成立分支", "否则分支"}
+        non_output_types = {
+            "等待", "循环动作", "调用子宏", "条件分支", "等待条件",
+            *branch_types,
+        }
         for preset in presets:
             stack = list(preset.get("actions", []) or [])
             while stack:
                 action = stack.pop()
-                action_total += 1
-                if action.get("type") not in ("等待", "循环动作"):
+                if action.get("type") not in branch_types:
+                    action_total += 1
+                if action.get("type") not in non_output_types:
                     action_outputs += 1
                 stack.extend(action.get("children", []) or [])
 

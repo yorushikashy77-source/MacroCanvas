@@ -45,7 +45,9 @@ MODIFIER_OPTIONS = {
 ACTION_TYPES = {
     "键盘点击", "鼠标点击", "鼠标滚轮", "鼠标移动", "等待", "循环动作",
     "调用子宏", "条件分支", "等待条件",
+    "条件成立分支", "否则分支",
 }
+CONDITION_BRANCH_TYPES = {"条件成立分支", "否则分支"}
 MAPPING_MODES = {
     "同步按住", "执行一次", "固定次数", "按住循环", "开关循环", "无限循环",
     "单次触发",  # 旧配置名称，载入时会迁移为“执行一次”。
@@ -403,20 +405,49 @@ def _validate_mapping(mapping, index, seen_ids):
             raise ValueError(f"{_path_text(path + ('condition_state',))} 不能为空")
 
 
-def _validate_action(action, path, state, depth, require_runtime_fields=False):
+def _validate_action(
+    action, path, state, depth, require_runtime_fields=False,
+    parent_type=None,
+):
     if depth > MAX_ACTION_DEPTH:
         raise ValueError(f"{_path_text(path)} 超过最大嵌套层级 {MAX_ACTION_DEPTH}")
     _require_dict(action, path)
-    state["count"] += 1
-    if state["count"] > MAX_ACTION_COUNT:
-        raise ValueError(f"{_path_text(path)} 的动作总数超过 {MAX_ACTION_COUNT}")
-
     if require_runtime_fields:
         _require_non_empty_field(action, "type", path)
     action_type = action.get("type", "键盘点击")
     _validate_choice(action_type, path + ("type",), ACTION_TYPES)
+    if action_type not in CONDITION_BRANCH_TYPES:
+        state["count"] += 1
+        if state["count"] > MAX_ACTION_COUNT:
+            raise ValueError(
+                f"{_path_text(path)} 的动作总数超过 {MAX_ACTION_COUNT}"
+            )
     children = action.get("children", [])
     _require_list(children, path + ("children",))
+
+    if action_type in CONDITION_BRANCH_TYPES and parent_type != "条件分支":
+        raise ValueError(
+            f"{_path_text(path)} 只能作为条件分支的直接子项"
+        )
+    if action_type == "条件分支":
+        branch_children = [
+            child for child in children
+            if isinstance(child, dict)
+            and child.get("type") in CONDITION_BRANCH_TYPES
+        ]
+        if branch_children:
+            if len(branch_children) != len(children):
+                raise ValueError(
+                    f"{_path_text(path + ('children',))} 不能混合分支容器和普通动作"
+                )
+            branch_types = [child.get("type") for child in branch_children]
+            if (
+                branch_types.count("条件成立分支") != 1
+                or branch_types.count("否则分支") != 1
+            ):
+                raise ValueError(
+                    f"{_path_text(path + ('children',))} 必须各包含一个条件成立分支和否则分支"
+                )
 
     if action_type == "循环动作":
         loop_id = action.get("id")
@@ -551,11 +582,16 @@ def _validate_action(action, path, state, depth, require_runtime_fields=False):
                     value, path + ("speed_percent",), 10, 500
                 ),
             })
+        elif action_type in CONDITION_BRANCH_TYPES:
+            pass
 
     for child_index, child in enumerate(children, 1):
+        child_type = child.get("type") if isinstance(child, dict) else None
         _validate_action(
-            child, path + (f"子动作 {child_index}",), state, depth + 1,
+            child, path + (f"子动作 {child_index}",), state,
+            depth if child_type in CONDITION_BRANCH_TYPES else depth + 1,
             require_runtime_fields=require_runtime_fields,
+            parent_type=action_type,
         )
 
 
@@ -644,7 +680,7 @@ def _validate_loop_references(actions, path):
             action_path = level_path + (f"动作 {action_index}",)
             if action.get("type") == "循环动作":
                 loop_controls.append((action, action_path, depth))
-            else:
+            elif action.get("type") not in CONDITION_BRANCH_TYPES:
                 action_id = str(action.get("action_id") or "")
                 if action_id:
                     ordinary_ids.append(action_id)

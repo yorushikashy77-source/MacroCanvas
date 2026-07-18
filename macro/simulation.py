@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import Counter
 
 from core.constants import (
-    CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+    CONDITION_ACTION_TYPE, CONDITION_BRANCH_TYPES,
+    SUBMACRO_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
 )
 from macro.scheduler import LOOP_ACTION_TYPE, MacroTask
 
@@ -31,7 +32,9 @@ def _scaled_range(base, jitter, speed, minimum=0):
 
 def _action_own_duration(action, speed):
     kind = str(action.get("type") or "动作")
-    if kind in (CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE):
+    if kind in (
+        CONDITION_ACTION_TYPE, SUBMACRO_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+    ):
         return 0, 0
     if kind == WAIT_CONDITION_ACTION_TYPE:
         timeout = _bounded_int(action.get("timeout_ms", 0), 0, 0, 600_000)
@@ -66,6 +69,21 @@ def _loop_controls(actions):
 
 def _action_group_duration(action, speed, library=None, call_stack=()):
     kind = str(action.get("type") or "动作")
+    if kind == CONDITION_ACTION_TYPE:
+        true_actions, else_actions = MacroTask.condition_branch_actions(action)
+        true_min, true_max = _sequence_duration(
+            true_actions, speed, timeline_mode="sequential",
+            library=library, call_stack=call_stack,
+        )
+        else_min, else_max = _sequence_duration(
+            else_actions, speed, timeline_mode="sequential",
+            library=library, call_stack=call_stack,
+        )
+        maxima = (true_max, else_max)
+        return (
+            min(true_min, else_min),
+            None if any(value is None for value in maxima) else max(maxima),
+        )
     if kind == SUBMACRO_ACTION_TYPE:
         target_id = str(action.get("preset_id") or "")
         target = (library or {}).get(target_id)
@@ -102,12 +120,11 @@ def _action_group_duration(action, speed, library=None, call_stack=()):
         timeline_mode=(
             "sequential" if kind in (
                 CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+                *CONDITION_BRANCH_TYPES,
             ) else "parallel"
         ),
         library=library, call_stack=call_stack,
     )
-    if kind == CONDITION_ACTION_TYPE:
-        return 0, child_max
     if kind == WAIT_CONDITION_ACTION_TYPE:
         return (
             child_min,

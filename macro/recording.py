@@ -1,6 +1,8 @@
 import copy
 import math
 
+from core.constants import CONTROL_ACTION_TYPES
+
 
 _MOVE_PREFIXES = {
     "rel:": "rel",
@@ -361,7 +363,10 @@ def simplify_recorded_actions(
                     raw["wait_ms"] = max(
                         1, round(int(raw.get("wait_ms", 1)) * scale)
                     )
-                elif kind not in ("鼠标移动", "鼠标滚轮", "循环动作"):
+                elif kind not in (
+                    "鼠标移动", "鼠标滚轮", "循环动作",
+                    *CONTROL_ACTION_TYPES,
+                ):
                     raw["hold_ms"] = max(
                         int(min_hold_ms),
                         round(int(raw.get("hold_ms", 30)) * scale),

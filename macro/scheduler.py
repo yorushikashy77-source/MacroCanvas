@@ -5,8 +5,10 @@ import time
 from PySide6.QtCore import QObject, Signal
 
 from core.constants import (
-    CONDITION_ACTION_TYPE, CONTROL_ACTION_TYPES, MOUSE_NAMES,
-    SUBMACRO_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE,
+    CONDITION_ACTION_TYPE, CONDITION_BRANCH_TYPES,
+    CONDITION_ELSE_BRANCH_TYPE, CONDITION_TRUE_BRANCH_TYPE,
+    CONTROL_ACTION_TYPES, MOUSE_NAMES, SUBMACRO_ACTION_TYPE,
+    WAIT_CONDITION_ACTION_TYPE,
 )
 from macro.actions import clone_action_tree
 from engine.window_context import (
@@ -948,6 +950,22 @@ class MacroTask:
         except Exception:
             return False
 
+    @staticmethod
+    def condition_branch_actions(action):
+        """Return true/false branch actions, accepting legacy true-only data."""
+        children = list(action.get("children", []) or [])
+        branches = {
+            child.get("type"): child.get("children", []) or []
+            for child in children
+            if child.get("type") in CONDITION_BRANCH_TYPES
+        }
+        if branches:
+            return (
+                list(branches.get(CONDITION_TRUE_BRANCH_TYPE, [])),
+                list(branches.get(CONDITION_ELSE_BRANCH_TYPE, [])),
+            )
+        return children, []
+
     def _wait_for_condition(self, action):
         timeout_ms = max(0, int(action.get("timeout_ms", 0)))
         poll_ms = max(10, min(1_000, int(action.get("poll_ms", 20))))
@@ -1006,8 +1024,18 @@ class MacroTask:
         kind = root_action.get("type")
         if kind == CONDITION_ACTION_TYPE:
             self._emit_action_activity(root_action)
-            if not self._condition_satisfied(root_action):
-                return True
+            true_actions, else_actions = self.condition_branch_actions(
+                root_action
+            )
+            selected_actions = (
+                true_actions if self._condition_satisfied(root_action)
+                else else_actions
+            )
+            return self._run_action_sequence(
+                selected_actions, speed,
+                timeline_mode="sequential", local_stop=self.stop_event,
+            )
+        if kind in CONDITION_BRANCH_TYPES:
             return self._run_action_sequence(
                 root_action.get("children", []) or [], speed,
                 timeline_mode="sequential", local_stop=self.stop_event,
@@ -1083,6 +1111,10 @@ class MacroTask:
                 f"条件分支：{action.get('condition_input', '')} "
                 f"{action.get('condition_state', '按住时')}"
             )
+        if kind == CONDITION_TRUE_BRANCH_TYPE:
+            return "条件成立分支"
+        if kind == CONDITION_ELSE_BRANCH_TYPE:
+            return "否则分支"
         if kind == WAIT_CONDITION_ACTION_TYPE:
             timeout = max(0, int(action.get("timeout_ms", 0)))
             suffix = f"，超时 {timeout}ms" if timeout else "，一直等待"

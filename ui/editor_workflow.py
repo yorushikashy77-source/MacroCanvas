@@ -35,9 +35,87 @@ from ui.editors import (
 
 ACTION_RECORDING_CONTEXT_ROLE = ACTION_ID_ROLE + 1
 ACTION_LEGACY_MODIFIERS_ROLE = ACTION_RECORDING_CONTEXT_ROLE + 1
+ACTION_BRANCH_TYPE_ROLE = ACTION_LEGACY_MODIFIERS_ROLE + 1
 
 
 class EditorWorkflowMixin:
+    @staticmethod
+    def semantic_action_count(actions):
+        return sum(
+            1 for action in iter_action_tree(actions)
+            if action.get("type") not in CONDITION_BRANCH_TYPES
+        )
+
+    def table_semantic_action_count(self, table):
+        return sum(
+            1 for item in table.iter_items()
+            if not self.is_condition_branch_item(item)
+        )
+
+    @staticmethod
+    def is_condition_branch_item(item):
+        return bool(
+            item is not None
+            and item.data(0, ACTION_BRANCH_TYPE_ROLE) in CONDITION_BRANCH_TYPES
+        )
+
+    @staticmethod
+    def normalize_condition_action_branches(action):
+        """Wrap legacy true-only children in two fixed branch containers."""
+        copied = dict(action or {})
+        if copied.get("type") != CONDITION_ACTION_TYPE:
+            return copied
+        children = list(copied.get("children", []) or [])
+        by_type = {
+            child.get("type"): dict(child)
+            for child in children
+            if isinstance(child, dict)
+            and child.get("type") in CONDITION_BRANCH_TYPES
+        }
+        if by_type:
+            true_branch = by_type.get(CONDITION_TRUE_BRANCH_TYPE, {
+                "type": CONDITION_TRUE_BRANCH_TYPE, "children": [],
+            })
+            else_branch = by_type.get(CONDITION_ELSE_BRANCH_TYPE, {
+                "type": CONDITION_ELSE_BRANCH_TYPE, "children": [],
+            })
+        else:
+            true_branch = {
+                "type": CONDITION_TRUE_BRANCH_TYPE,
+                "children": children,
+            }
+            else_branch = {
+                "type": CONDITION_ELSE_BRANCH_TYPE,
+                "children": [],
+            }
+        for branch in (true_branch, else_branch):
+            branch["action_id"] = str(
+                branch.get("action_id") or uuid.uuid4().hex
+            )
+            branch["children"] = list(branch.get("children", []) or [])
+        copied["children"] = [true_branch, else_branch]
+        return copied
+
+    @staticmethod
+    def _condition_branch_child(item, branch_type):
+        if item is None:
+            return None
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if child.data(0, ACTION_BRANCH_TYPE_ROLE) == branch_type:
+                return child
+        return None
+
+    @staticmethod
+    def update_condition_branch_summary(table, item):
+        if item is None or item.data(0, ACTION_BRANCH_TYPE_ROLE) not in CONDITION_BRANCH_TYPES:
+            return
+        label = table.itemWidget(item, 3)
+        if isinstance(label, QLabel):
+            label.setText(
+                f"{item.childCount()} 个直接动作 · 选中后可继续添加"
+            )
+
     def _submacro_preset_options(self, card=None):
         return [
             (str(other.preset_id), other.name.text().strip() or "未命名预设")
@@ -280,6 +358,13 @@ class EditorWorkflowMixin:
                 "循环卡片不能作为新的循环开始点或结束点。请选择普通动作。",
             )
             return
+        if self.is_condition_branch_item(item):
+            QMessageBox.information(
+                card.action_dialog,
+                "无法选择分支容器",
+                "请选择“条件成立”或“否则”分支里的普通动作。",
+            )
+            return
         stage = getattr(card, "loop_point_stage", 0)
         if stage == 1:
             card.loop_start_item = item
@@ -420,6 +505,8 @@ class EditorWorkflowMixin:
             return
         if self.is_loop_action_item(source_item):
             return
+        if self.is_condition_branch_item(source_item):
+            return
         self.reset_loop_point_selection(card)
         table = card.action_table
 
@@ -455,12 +542,34 @@ class EditorWorkflowMixin:
         )
         new_path = None
         target_path = self._find_action_path(actions, target_action)
-        if target_action is not None and target_action.get("type") == LOOP_ACTION_TYPE:
+        target_type = target_action.get("type") if target_action else ""
+        if target_action is not None and target_type == LOOP_ACTION_TYPE:
             actions.insert(first_loop_index, source_action)
             new_path = (first_loop_index,)
         elif position == on_viewport or target_action is None or target_path is None:
             actions.insert(first_loop_index, source_action)
             new_path = (first_loop_index,)
+        elif target_type == CONDITION_ACTION_TYPE and position == on_item:
+            branches = target_action.get("children", []) or []
+            true_branch = next(
+                (
+                    branch for branch in branches
+                    if branch.get("type") == CONDITION_TRUE_BRANCH_TYPE
+                ),
+                None,
+            )
+            if true_branch is None:
+                return
+            children = true_branch.setdefault("children", [])
+            children.append(source_action)
+            branch_path = self._find_action_path(actions, true_branch)
+            new_path = branch_path + (len(children) - 1,)
+        elif target_type in CONDITION_BRANCH_TYPES:
+            children = target_action.setdefault("children", [])
+            insert_at = 0 if position == above_item else len(children)
+            children.insert(insert_at, source_action)
+            branch_path = self._find_action_path(actions, target_action)
+            new_path = branch_path + (insert_at,)
         elif position == on_item:
             children = target_action.setdefault("children", [])
             children.append(source_action)
@@ -690,6 +799,19 @@ class EditorWorkflowMixin:
         current = table.currentItem()
         if current is None:
             return None, None
+        if self.is_condition_branch_item(current):
+            return current, current.childCount()
+        if (
+            table.itemWidget(current, 1) is not None
+            and hasattr(table.itemWidget(current, 1), "currentText")
+            and table.itemWidget(current, 1).currentText()
+            == CONDITION_ACTION_TYPE
+        ):
+            true_branch = self._condition_branch_child(
+                current, CONDITION_TRUE_BRANCH_TYPE
+            )
+            if true_branch is not None:
+                return true_branch, true_branch.childCount()
 
         parent = current.parent()
         if parent is not None and not self.is_loop_action_item(current):
@@ -719,7 +841,7 @@ class EditorWorkflowMixin:
             QMessageBox.information(self, "提示", "请先添加或选择一个预设方案。")
             return None
         self.select_preset_card(card)
-        if card.action_table.total_item_count() >= MAX_ACTION_COUNT:
+        if self.table_semantic_action_count(card.action_table) >= MAX_ACTION_COUNT:
             QMessageBox.warning(
                 getattr(card, "action_dialog", None) or self,
                 "无法添加动作",
@@ -730,9 +852,11 @@ class EditorWorkflowMixin:
             "type": "键盘点击", "target": "A", "hold_ms": 100,
             "jitter_ms": 0, "children": [],
         })
+        action = self.normalize_condition_action_branches(action)
         table = card.action_table
         item = QTreeWidgetItem()
         is_loop = action.get("type") == LOOP_ACTION_TYPE
+        is_condition_branch = action.get("type") in CONDITION_BRANCH_TYPES
         if is_loop:
             parent_item = None
             insert_index = None
@@ -746,6 +870,10 @@ class EditorWorkflowMixin:
                 insert_index = first_loop_index
         if is_loop:
             item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        elif is_condition_branch:
+            item.setFlags(
+                Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
+            )
         else:
             item.setFlags(
                 item.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
@@ -768,11 +896,17 @@ class EditorWorkflowMixin:
             })
         item.setText(
             0,
-            "循环卡片" if is_loop else ("子动作" if parent_item is not None else "动作")
+            "循环卡片" if is_loop
+            else (
+                "成立分支" if action.get("type") == CONDITION_TRUE_BRANCH_TYPE
+                else "否则分支" if is_condition_branch
+                else "子动作" if parent_item is not None else "动作"
+            )
         )
         item.setToolTip(
             0,
             "循环卡片固定在方案末尾" if is_loop
+            else "分支容器固定在条件动作下" if is_condition_branch
             else "按住此处拖拽，可改变顺序或层级",
         )
         if parent_item is not None:
@@ -827,6 +961,26 @@ class EditorWorkflowMixin:
             parameter_layout.addWidget(parameter_button)
             table.setItemWidget(item, 3, parameter_host)
             self.update_loop_action_summary(card, item)
+        elif is_condition_branch:
+            branch_type = action.get("type")
+            item.setData(0, ACTION_BRANCH_TYPE_ROLE, branch_type)
+            branch_name = (
+                "条件成立" if branch_type == CONDITION_TRUE_BRANCH_TYPE else "否则"
+            )
+            name_label = QLabel(branch_name)
+            name_label.setObjectName("sectionLabel")
+            target_label = QLabel(
+                "条件匹配时执行" if branch_type == CONDITION_TRUE_BRANCH_TYPE
+                else "条件不匹配时执行"
+            )
+            target_label.setObjectName("muted")
+            summary_label = QLabel(
+                f"{len(action.get('children', []) or [])} 个直接动作 · 选中后可继续添加"
+            )
+            summary_label.setObjectName("muted")
+            table.setItemWidget(item, 1, name_label)
+            table.setItemWidget(item, 2, target_label)
+            table.setItemWidget(item, 3, summary_label)
         else:
             kind = self.combo(ACTION_TYPES, action.get("type", "键盘点击"), changed)
             target = ActionTargetEditor(
@@ -894,16 +1048,26 @@ class EditorWorkflowMixin:
                 lambda text, control=duration, editor=target:
                 self.update_action_duration_field(text, control, editor)
             )
+            kind.currentTextChanged.connect(
+                lambda text, c=card, i=item:
+                self.schedule_action_type_structure_update(c, i, text)
+            )
             self.update_action_duration_field(kind.currentText(), duration, target)
 
-        delete = QPushButton("删除")
-        delete.setObjectName("dangerGhost")
-        delete.setFixedWidth(62)
-        delete.setMinimumHeight(34)
-        delete.clicked.connect(
-            lambda _checked=False, i=item, c=card: self.delete_action_item(i, c)
-        )
-        table.setItemWidget(item, 4, delete)
+        if is_condition_branch:
+            fixed_label = QLabel("固定")
+            fixed_label.setObjectName("muted")
+            fixed_label.setAlignment(Qt.AlignCenter)
+            table.setItemWidget(item, 4, fixed_label)
+        else:
+            delete = QPushButton("删除")
+            delete.setObjectName("dangerGhost")
+            delete.setFixedWidth(62)
+            delete.setMinimumHeight(34)
+            delete.clicked.connect(
+                lambda _checked=False, i=item, c=card: self.delete_action_item(i, c)
+            )
+            table.setItemWidget(item, 4, delete)
 
         if not is_loop:
             for child in action.get("children", []) or []:
@@ -912,6 +1076,10 @@ class EditorWorkflowMixin:
                 )
         else:
             self._style_loop_action_row(table, item, data)
+        if is_condition_branch:
+            self.update_condition_branch_summary(table, item)
+        if parent_item is not None and self.is_condition_branch_item(parent_item):
+            self.update_condition_branch_summary(table, parent_item)
         if not getattr(self, "_bulk_loading_actions", False):
             table.setCurrentItem(item)
             self.update_card_action_summary(card)
@@ -938,6 +1106,63 @@ class EditorWorkflowMixin:
         editor.set_action_type(action_type, old, emit=False)
         if notify:
             self.action_changed(card)
+
+    def schedule_action_type_structure_update(self, card, item, action_type):
+        QTimer.singleShot(
+            0,
+            lambda c=card, i=item, kind=str(action_type):
+            self._update_action_type_structure(c, i, kind),
+        )
+
+    def _update_action_type_structure(self, card, item, action_type):
+        if (
+            card not in getattr(self, "preset_cards", [])
+            or item is None
+            or self.is_loop_action_item(item)
+            or self.is_condition_branch_item(item)
+        ):
+            return
+        table = card.action_table
+        path = self._action_item_path(table, item)
+        if not path:
+            return
+        kind_widget = table.itemWidget(item, 1)
+        if (
+            kind_widget is None
+            or not hasattr(kind_widget, "currentText")
+            or kind_widget.currentText() != action_type
+        ):
+            return
+        children = [
+            self.action_from_item(table, item.child(index))
+            for index in range(item.childCount())
+        ]
+        has_branches = bool(children) and all(
+            child.get("type") in CONDITION_BRANCH_TYPES for child in children
+        )
+        if action_type == CONDITION_ACTION_TYPE and not has_branches:
+            replacement_children = self.normalize_condition_action_branches({
+                "type": CONDITION_ACTION_TYPE, "children": children,
+            })["children"]
+        elif action_type != CONDITION_ACTION_TYPE and has_branches:
+            replacement_children = []
+            for branch in children:
+                replacement_children.extend(branch.get("children", []) or [])
+        else:
+            return
+
+        actions = self.collect_visible_actions(card)
+        action = self._action_at_path(actions, path)
+        if action is None:
+            return
+        action["children"] = replacement_children
+        self.load_actions(actions, card)
+        selected = self._item_at_path(card.action_table, path)
+        if selected is not None:
+            card.action_table.setCurrentItem(selected)
+            selected.setSelected(True)
+            selected.setExpanded(True)
+        self.action_changed(card)
 
     def update_card_action_summary(self, card):
         if card is None:
@@ -975,6 +1200,14 @@ class EditorWorkflowMixin:
         card = card or self.selected_preset_card
         if card is None or item is None:
             return
+        if self.is_condition_branch_item(item):
+            QMessageBox.information(
+                getattr(card, "action_dialog", None) or self,
+                "分支容器不可删除",
+                "“条件成立”和“否则”是条件动作的固定结构。"
+                "可以删除其中的动作，或删除整个条件动作。",
+            )
+            return
         subtree_count = sum(
             1 for _ in iter_action_tree([self.action_from_item(card.action_table, item)])
         )
@@ -997,6 +1230,7 @@ class EditorWorkflowMixin:
                     card.action_table.takeTopLevelItem(index)
             else:
                 parent.removeChild(item)
+                self.update_condition_branch_summary(card.action_table, parent)
             self.update_card_action_summary(card)
             self.action_changed(card)
         finally:
@@ -1020,7 +1254,7 @@ class EditorWorkflowMixin:
         self.select_preset_card(card)
         table = card.action_table
         item = table.currentItem()
-        if self.is_loop_action_item(item):
+        if self.is_loop_action_item(item) or self.is_condition_branch_item(item):
             return
         path = self._action_item_path(table, item)
         if not path:
@@ -1050,7 +1284,7 @@ class EditorWorkflowMixin:
         if card is None:
             return
         actions = list(actions or [])
-        action_count = sum(1 for _ in iter_action_tree(actions))
+        action_count = self.semantic_action_count(actions)
         if action_count > MAX_ACTION_COUNT:
             QMessageBox.warning(
                 getattr(card, "action_dialog", None) or self,
@@ -1276,6 +1510,18 @@ class EditorWorkflowMixin:
             data["children"] = []
             return data
 
+        if self.is_condition_branch_item(item):
+            return {
+                "type": item.data(0, ACTION_BRANCH_TYPE_ROLE),
+                "action_id": str(
+                    item.data(0, ACTION_ID_ROLE) or uuid.uuid4().hex
+                ),
+                "children": [
+                    self.action_from_item(table, item.child(index))
+                    for index in range(item.childCount())
+                ],
+            }
+
         action_type = table.itemWidget(item, 1).currentText()
         action = {
             "type": action_type,
@@ -1342,9 +1588,13 @@ class EditorWorkflowMixin:
             return
         self.select_preset_card(card)
         table = card.action_table
+        selected = [
+            item for item in self.selected_action_items(card)
+            if not self.is_condition_branch_item(item)
+        ]
         self.action_clipboard = [
             self.action_from_item(table, item)
-            for item in self.selected_action_items(card)
+            for item in selected
         ]
 
     def paste_actions(self, card=None):
@@ -1372,11 +1622,19 @@ class EditorWorkflowMixin:
         payload = remap_action_ids(
             self.action_clipboard, preserve_external=True
         )
+        payload = [
+            action for action in payload
+            if action.get("type") not in CONDITION_BRANCH_TYPES
+        ]
+        if not payload:
+            return
         existing_actions = self.collect_visible_actions(card)
         existing_ordinary_ids = {
             str(action.get("action_id"))
             for action in iter_action_tree(existing_actions)
-            if action.get("type") != LOOP_ACTION_TYPE and action.get("action_id")
+            if action.get("type") not in (
+                LOOP_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+            ) and action.get("action_id")
         }
         existing_loop_ids = {
             str(action_id)
@@ -1388,7 +1646,9 @@ class EditorWorkflowMixin:
         payload_ordinary_ids = {
             str(action.get("action_id"))
             for action in iter_action_tree(payload)
-            if action.get("type") != LOOP_ACTION_TYPE and action.get("action_id")
+            if action.get("type") not in (
+                LOOP_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+            ) and action.get("action_id")
         }
         available_ids = existing_ordinary_ids | payload_ordinary_ids
         payload_claimed_ids = set()
@@ -1421,8 +1681,8 @@ class EditorWorkflowMixin:
                 )
                 return
             payload_claimed_ids.update(target_ids)
-        pasted_count = sum(1 for _ in iter_action_tree(payload))
-        current_count = table.total_item_count()
+        pasted_count = self.semantic_action_count(payload)
+        current_count = self.table_semantic_action_count(table)
         if current_count + pasted_count > MAX_ACTION_COUNT:
             QMessageBox.warning(
                 getattr(card, "action_dialog", None) or self,
@@ -1472,8 +1732,20 @@ class EditorWorkflowMixin:
             return
         self.reset_loop_point_selection(card)
         self.select_preset_card(card)
-        items = self.selected_action_items(card)
+        items = [
+            item for item in self.selected_action_items(card)
+            if not self.is_condition_branch_item(item)
+        ]
         if not items:
+            if any(
+                self.is_condition_branch_item(item)
+                for item in card.action_table.selectedItems()
+            ):
+                QMessageBox.information(
+                    getattr(card, "action_dialog", None) or self,
+                    "分支容器不可删除",
+                    "请删除分支内的动作，或选中上层条件动作后删除。",
+                )
             return
         delete_count = sum(
             sum(
@@ -1493,6 +1765,10 @@ class EditorWorkflowMixin:
                 host=getattr(card, "action_dialog", None) or self,
             )
         try:
+            branch_parents = {
+                item.parent() for item in items
+                if self.is_condition_branch_item(item.parent())
+            }
             for item in items:
                 parent = item.parent()
                 if parent is None:
@@ -1501,6 +1777,10 @@ class EditorWorkflowMixin:
                         card.action_table.takeTopLevelItem(index)
                 else:
                     parent.removeChild(item)
+            for branch_parent in branch_parents:
+                self.update_condition_branch_summary(
+                    card.action_table, branch_parent
+                )
             self.update_card_action_summary(card)
             self.action_changed(card)
         finally:
@@ -1583,7 +1863,9 @@ class EditorWorkflowMixin:
         valid_ids = {
             str(action.get("action_id"))
             for action in iter_action_tree(ordinary)
-            if action.get("type") != LOOP_ACTION_TYPE and action.get("action_id")
+            if action.get("type") not in (
+                LOOP_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+            ) and action.get("action_id")
         }
         for loop in loops:
             loop["target_action_ids"] = [
@@ -1620,7 +1902,10 @@ class EditorWorkflowMixin:
             ids = [
                 str(item.data(0, ACTION_ID_ROLE))
                 for item in ordinary_items
-                if item.data(0, ACTION_ID_ROLE)
+                if (
+                    item.data(0, ACTION_ID_ROLE)
+                    and not self.is_condition_branch_item(item)
+                )
             ]
             if ids:
                 sibling_sequences.append(ids)
