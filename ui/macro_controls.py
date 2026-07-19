@@ -86,6 +86,23 @@ class MacroControlsMixin:
         if dialog is not None:
             dialog.close()
 
+    def locate_macro_run_history_action(self, preset_id, action_id=""):
+        """Open a recorded failure's editor and visibly select its action."""
+        preset_id = str(preset_id or "")
+        action_id = str(action_id or "")
+        card = next(
+            (item for item in getattr(self, "preset_cards", [])
+             if str(getattr(item, "preset_id", "") or "") == preset_id),
+            None,
+        )
+        if card is None:
+            return False
+        self.open_preset_actions_dialog(card)
+        if not action_id:
+            return True
+        focus = getattr(self, "_focus_submacro_overview_action", None)
+        return bool(callable(focus) and focus(card, action_id))
+
     def open_macro_run_history(self):
         dialog = QDialog(self)
         self.macro_run_history_dialog = dialog
@@ -157,17 +174,18 @@ class MacroControlsMixin:
             row = hint.currentItem()
             preset_id = str(row.data(0, 32) or "") if row is not None else ""
             action_id = str(row.data(1, 32) or "") if row is not None else ""
-            card = next(
-                (item for item in getattr(self, "preset_cards", [])
-                 if str(item.preset_id) == preset_id),
-                None,
+            if not preset_id:
+                return
+            # Let the modal history window finish closing before raising the
+            # action editor; otherwise its modal focus can immediately hide
+            # the newly opened editor on some Windows/Qt combinations.
+            dialog.accept()
+            QTimer.singleShot(
+                0,
+                lambda: self.locate_macro_run_history_action(
+                    preset_id, action_id
+                ),
             )
-            if card is not None:
-                dialog.accept()
-                self.open_preset_actions_dialog(card)
-                focus = getattr(self, "_focus_submacro_overview_action", None)
-                if callable(focus) and action_id:
-                    focus(card, action_id)
 
         hint.itemDoubleClicked.connect(locate_selected)
         layout.addWidget(buttons)

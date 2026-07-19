@@ -129,6 +129,21 @@ class _MacroFinishHarness(MacroControlsMixin):
         pass
 
 
+class _MacroHistoryLocationHarness(MacroControlsMixin):
+    def __init__(self):
+        self.target_card = SimpleNamespace(preset_id="child")
+        self.preset_cards = [self.target_card]
+        self.opened_card = None
+        self.focused = None
+
+    def open_preset_actions_dialog(self, card):
+        self.opened_card = card
+
+    def _focus_submacro_overview_action(self, card, action_id):
+        self.focused = (card, action_id)
+        return action_id == "wait-space"
+
+
 class _RecordingHarness(RecordingWorkflowMixin):
     def __init__(self):
         self.recording_restore_pending = False
@@ -249,6 +264,18 @@ class InteractionLogicFixTests(unittest.TestCase):
         )
         self.assertIsNone(harness._record_macro_run_history(mapping))
         self.assertEqual(len(harness.macro_run_history), 2)
+
+    def test_macro_history_location_opens_the_action_editor_and_focuses_action(self):
+        harness = _MacroHistoryLocationHarness()
+
+        self.assertTrue(
+            harness.locate_macro_run_history_action("child", "wait-space")
+        )
+        self.assertIs(harness.opened_card, harness.target_card)
+        self.assertEqual(harness.focused, (harness.target_card, "wait-space"))
+        self.assertFalse(
+            harness.locate_macro_run_history_action("missing", "wait-space")
+        )
 
     def test_finish_hotkey_during_countdown_does_not_cancel(self):
         harness = _RecordingHarness()
