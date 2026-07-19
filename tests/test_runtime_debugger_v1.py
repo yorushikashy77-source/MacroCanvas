@@ -291,6 +291,141 @@ class RuntimeDebuggerControllerTests(unittest.TestCase):
         controller.set_debug_enabled(False)
         self.assertFalse(task.debug_pause_next)
 
+    def test_disabling_debugger_resumes_only_debugger_owned_pause(self):
+        controller = MacroController(_Engine(), is_active=lambda: True)
+        controller.set_debug_enabled(True)
+        controller.set_debug_breakpoints({("root", "first")})
+        sent = []
+
+        def send(action, phase, **_kwargs):
+            sent.append((action.get("target"), phase))
+            return True
+
+        task = MacroTask(
+            _preset("root", [{
+                "action_id": "first", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+            }]),
+            _Engine(), _Signals(), send_output=send,
+            is_active=lambda: True, debug_state=controller._debug_snapshot,
+        )
+        controller.tasks["root"] = task
+        task.start()
+        try:
+            self.assertTrue(_wait_until(lambda: bool(task.debug_pause_info)))
+            self.assertFalse(task.run_event.is_set())
+            controller.set_debug_enabled(False)
+            self.assertTrue(task.wait_for_exit(timeout=1.5))
+            self.assertEqual(sent, [("A", "Press"), ("A", "Release")])
+            self.assertIsNone(task.debug_pause_info)
+        finally:
+            task.stop()
+            task.wait_for_exit(timeout=1.0)
+
+        manually_paused = MacroTask(
+            _preset("manual", []), _Engine(), _Signals(),
+            is_active=lambda: True, debug_state=controller._debug_snapshot,
+        )
+        self.assertTrue(manually_paused.pause())
+        controller.tasks["manual"] = manually_paused
+        controller.set_debug_enabled(False)
+        self.assertFalse(manually_paused.run_event.is_set())
+        manually_paused.stop()
+
+    def test_nested_breakpoint_step_parameters_then_debugger_close_continues(self):
+        grand = _preset("grand", [
+            {
+                "action_id": "grand-first", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+                "parameter_bindings": {"target": "grand_key"},
+            },
+            {
+                "action_id": "grand-second", "type": "键盘点击",
+                "target": "D", "hold_ms": 1,
+            },
+        ], [{"name": "grand_key", "type": "按键", "default": "A"}])
+        child = _preset("child", [
+            {
+                "action_id": "child-key", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+                "parameter_bindings": {"target": "child_key"},
+            },
+            {
+                "action_id": "call-grand", "type": "调用子宏",
+                "preset_id": "grand", "repeat_count": 1,
+                "speed_percent": 100,
+                "parameter_values": {"grand_key": "C"},
+            },
+        ], [{"name": "child_key", "type": "按键", "default": "A"}])
+        root = _preset("root", [
+            {
+                "action_id": "root-first", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+            },
+            {
+                "action_id": "call-child", "type": "调用子宏",
+                "preset_id": "child", "repeat_count": 1,
+                "speed_percent": 100,
+                "parameter_values": {"child_key": "B"},
+            },
+        ])
+        library = {"root": root, "child": child, "grand": grand}
+        for preset in library.values():
+            preset["_preset_library"] = library
+
+        controller = MacroController(_Engine(), is_active=lambda: True)
+        controller.set_debug_enabled(True)
+        controller.set_debug_breakpoints({("grand", "grand-first")})
+        sent = []
+
+        def send(action, phase, **_kwargs):
+            sent.append((action.get("target"), phase))
+            return True
+
+        task = MacroTask(
+            root, _Engine(), _Signals(), send_output=send,
+            is_active=lambda: True, debug_state=controller._debug_snapshot,
+        )
+        controller.tasks["root"] = task
+        task.start()
+        try:
+            self.assertTrue(_wait_until(
+                lambda: (task.debug_pause_info or {}).get("action_id")
+                == "grand-first"
+            ))
+            self.assertEqual(
+                sent,
+                [
+                    ("A", "Press"), ("A", "Release"),
+                    ("B", "Press"), ("B", "Release"),
+                ],
+            )
+            self.assertEqual(
+                task.debug_pause_info["path"], ["root", "child", "grand"]
+            )
+            self.assertEqual(
+                task.debug_pause_info["parameters"], {"grand_key": "C"}
+            )
+
+            self.assertTrue(controller.debug_step("root"))
+            self.assertTrue(_wait_until(
+                lambda: (task.debug_pause_info or {}).get("action_id")
+                == "grand-second"
+            ))
+            self.assertEqual(sent[-2:], [("C", "Press"), ("C", "Release")])
+            self.assertEqual(task.debug_pause_info["reason"], "step")
+            self.assertEqual(
+                task.debug_pause_info["parameters"], {"grand_key": "C"}
+            )
+
+            controller.set_debug_enabled(False)
+            self.assertTrue(task.wait_for_exit(timeout=1.5))
+            self.assertEqual(sent[-2:], [("D", "Press"), ("D", "Release")])
+            self.assertEqual(task.finish_reason, "completed")
+        finally:
+            task.stop()
+            task.wait_for_exit(timeout=1.0)
+
 
 class _BreakpointHarness(EditorWorkflowMixin):
     def __init__(self):
@@ -414,10 +549,36 @@ class RuntimeDebuggerQtTests(unittest.TestCase):
         self.assertTrue(
             {"下一动作暂停", "单步", "继续", "定位动作"}.issubset(labels)
         )
-        harness.runtime_debug_dialog.close()
-        self.app.processEvents()
-        self.assertFalse(harness.runtime_debug_enabled)
-        self.assertFalse(harness.macro_controller._debug_snapshot()["enabled"])
+        sent = []
+
+        def send(action, phase, **_kwargs):
+            sent.append((action.get("target"), phase))
+            return True
+
+        task = MacroTask(
+            _preset("root", [{
+                "action_id": "first", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+            }]),
+            _Engine(), _Signals(), send_output=send,
+            is_active=lambda: True,
+            debug_state=harness.macro_controller._debug_snapshot,
+        )
+        harness.macro_controller.tasks["root"] = task
+        task.start()
+        try:
+            self.assertTrue(_wait_until(lambda: bool(task.debug_pause_info)))
+            harness.runtime_debug_dialog.close()
+            self.app.processEvents()
+            self.assertFalse(harness.runtime_debug_enabled)
+            self.assertFalse(
+                harness.macro_controller._debug_snapshot()["enabled"]
+            )
+            self.assertTrue(task.wait_for_exit(timeout=1.5))
+            self.assertEqual(sent, [("A", "Press"), ("A", "Release")])
+        finally:
+            task.stop()
+            task.wait_for_exit(timeout=1.0)
 
 
 if __name__ == "__main__":

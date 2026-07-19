@@ -217,6 +217,19 @@ class MacroTask:
         with self.debug_lock:
             self.debug_pause_next = False
 
+    def disable_debugging(self):
+        """Cancel debugger state and resume only a debugger-owned pause."""
+        with self.debug_lock:
+            self.debug_pause_next = False
+            debug_paused = bool(
+                self.debug_pause_info and not self.run_event.is_set()
+            )
+            if debug_paused:
+                self.debug_pause_info = None
+        if not debug_paused:
+            return False
+        return self.resume(preserve_debug=True)
+
     def debug_step(self):
         with self.debug_lock:
             if self.run_event.is_set() or not self.debug_pause_info:
@@ -1520,7 +1533,7 @@ class MacroController:
             with self.lock:
                 tasks = list(self.tasks.values())
             for task in tasks:
-                task.cancel_pending_debug_pause()
+                task.disable_debugging()
         self.signals.state_changed.emit()
 
     def set_debug_breakpoints(self, breakpoints):
