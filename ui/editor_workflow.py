@@ -899,12 +899,8 @@ class EditorWorkflowMixin:
             visit(preset_id)
         return issues
 
-    def open_preset_health_check(self, card=None):
-        """Inspect the currently editable preset scope and locate findings."""
-        card = card or self.selected_preset_card
-        if card is None:
-            return
-        self.select_preset_card(card)
+    def current_preset_health_issues(self):
+        """Return health findings for the same preset scope shown in the editor."""
         presets = [
             {
                 "id": str(other.preset_id),
@@ -914,7 +910,15 @@ class EditorWorkflowMixin:
             }
             for other in self.preset_cards
         ]
-        issues = self._preset_health_issues_from_data(presets)
+        return self._preset_health_issues_from_data(presets)
+
+    def open_preset_health_check(self, card=None):
+        """Inspect the currently editable preset scope and locate findings."""
+        card = card or self.selected_preset_card
+        if card is None:
+            return []
+        self.select_preset_card(card)
+        issues = self.current_preset_health_issues()
         dialog = QDialog(getattr(card, "action_dialog", None) or self)
         dialog.setWindowTitle("方案健康检查")
         dialog.resize(900, 560)
@@ -975,6 +979,7 @@ class EditorWorkflowMixin:
         locate.clicked.connect(locate_selected)
         layout.addWidget(buttons)
         dialog.exec()
+        return issues
 
     def _edit_submacro_parameter_values(self, card, item, action):
         target_id = str(action.get("preset_id") or "")

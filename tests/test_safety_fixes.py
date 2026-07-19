@@ -144,6 +144,18 @@ class StaticWorkflowSafetyTests(unittest.TestCase):
         self.assertIn("应用并退出", close)
         self.assertIn("取消退出", close)
 
+    def test_apply_runs_readable_health_check_before_raw_validation(self):
+        text = (ROOT / "ui" / "runtime_lifecycle.py").read_text("utf-8")
+        method = text[text.index("    def _apply_changes_impl"):text.index(
+            "    def set_running", text.index("    def _apply_changes_impl")
+        )]
+        self.assertIn("current_preset_health_issues", method)
+        self.assertIn("open_preset_health_check", method)
+        self.assertLess(
+            method.index("current_preset_health_issues"),
+            method.index("validate_config_payload("),
+        )
+
     def test_auto_apply_defers_and_profile_order_is_editable(self):
         editor = (ROOT / "ui" / "editor_workflow.py").read_text("utf-8")
         self.assertIn("当前宏结束后再自动应用", editor)

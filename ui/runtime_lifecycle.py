@@ -543,6 +543,19 @@ class RuntimeLifecycleMixin:
         target_profile = self._profile_record(target_editor_id)
         if target_editor_id and target_profile is None:
             self.editor_profile_id = ""
+        health_check = getattr(self, "current_preset_health_issues", None)
+        health_issues = health_check() if callable(health_check) else []
+        if health_issues:
+            self.config_state = ConfigState.FAILED
+            if getattr(self, "_auto_apply_in_progress", False):
+                self.engine_hint.setStyleSheet("color: #fbbf24;")
+                self.engine_hint.setText(
+                    "自动应用已暂停：当前方案检查发现问题，请修正后再应用"
+                )
+            else:
+                self.open_preset_health_check(self.selected_preset_card)
+            self.refresh_status_ui()
+            return False
         if not self.confirm_trigger_conflict_report():
             return False
 
