@@ -1284,6 +1284,7 @@ class InputRuntimeMixin:
                 ),
                 "speed_percent": int(mapping.get("speed_percent", 100)),
                 "max_runtime_s": int(mapping.get("max_runtime_s", 0)),
+                "parameters": copy.deepcopy(mapping.get("parameters", [])),
                 "actions": clone_action_tree(mapping.get("actions", [])),
                 "_preset_library": mapping.get("_preset_library", {}),
             }

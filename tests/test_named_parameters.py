@@ -5,6 +5,7 @@ from config.schema import validate_config_payload
 from macro.parameters import resolve_action_parameters
 from macro.scheduler import MacroTask
 from macro.simulation import simulate_preset
+from ui.input_runtime import InputRuntimeMixin
 from ui.main_window import MainWindow
 
 
@@ -24,6 +25,10 @@ class _Engine:
     @staticmethod
     def is_running():
         return True
+
+
+class _RuntimeTaskHarness(InputRuntimeMixin):
+    pass
 
 
 def _preset(preset_id, actions, parameters=None):
@@ -128,6 +133,23 @@ class NamedParameterRuntimeTests(unittest.TestCase):
         resolved = resolve_action_parameters(preset["actions"], preset)
         self.assertEqual(resolved[0]["wait_ms"], 75)
         self.assertEqual(preset["actions"][0]["wait_ms"], 20)
+
+    def test_runtime_task_keeps_preset_parameters_for_action_bindings(self):
+        preset = _preset("root", [{
+            "action_id": "key", "type": "键盘点击", "target": "A",
+            "hold_ms": 1, "parameter_bindings": {"target": "技能键"},
+        }], [{"name": "技能键", "type": "按键", "default": "B"}])
+        rule = MainWindow._preset_as_mapping_rule(preset)
+        runtime_task = _RuntimeTaskHarness().mapping_to_task(rule)
+        self.assertEqual(runtime_task["parameters"], preset["parameters"])
+        runtime_task["parameters"][0]["default"] = "C"
+        self.assertEqual(preset["parameters"][0]["default"], "B")
+
+        task = MacroTask(
+            _RuntimeTaskHarness().mapping_to_task(rule),
+            _Engine(), _Signals(), is_active=lambda: True,
+        )
+        self.assertEqual(task.preset["actions"][0]["target"], "B")
 
     def test_submacro_call_override_changes_output_key(self):
         child = _preset("child", [{
