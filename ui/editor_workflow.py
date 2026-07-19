@@ -596,11 +596,15 @@ class EditorWorkflowMixin:
         return entries
 
     def _focus_submacro_overview_action(self, card, action_id):
-        """Select the call action represented by an overview row."""
+        """Select an action or loop control represented by an overview row."""
         if not action_id:
             return False
         for item in card.action_table.iter_items():
-            if str(item.data(0, ACTION_ID_ROLE) or "") != action_id:
+            item_action_id = str(item.data(0, ACTION_ID_ROLE) or "")
+            item_loop_id = str(
+                (item.data(0, LOOP_DATA_ROLE) or {}).get("id") or ""
+            )
+            if action_id not in (item_action_id, item_loop_id):
                 continue
             card.action_table.setCurrentItem(item)
             item.setSelected(True)
@@ -717,6 +721,255 @@ class EditorWorkflowMixin:
                 if selected is not None else ""
             )
             if self._focus_submacro_overview_action(card, action_id):
+                dialog.accept()
+
+        locate.clicked.connect(locate_selected)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    @staticmethod
+    def _preset_health_issues_from_data(presets):
+        """Return actionable, human-readable issues for one preset scope."""
+        presets_by_id = {
+            str(preset.get("id") or ""): preset
+            for preset in presets or [] if str(preset.get("id") or "")
+        }
+        issues = []
+        calls_by_source = {preset_id: [] for preset_id in presets_by_id}
+
+        def add_issue(preset, path, description, action_id=""):
+            issues.append({
+                "preset_id": str(preset.get("id") or ""),
+                "preset_name": str(preset.get("name") or "未命名预设"),
+                "path": path or "预设设置",
+                "description": description,
+                "action_id": str(action_id or ""),
+            })
+
+        for preset_id, preset in presets_by_id.items():
+            definitions = {
+                str(item.get("name") or "")
+                for item in preset.get("parameters", []) or []
+                if isinstance(item, dict) and str(item.get("name") or "")
+            }
+            sibling_sequences = []
+            loops = []
+
+            def walk(actions, path=(), depth=0):
+                ordinary_ids = []
+                for index, action in enumerate(actions or [], 1):
+                    if not isinstance(action, dict):
+                        continue
+                    action_type = str(action.get("type") or "动作")
+                    action_path = path + (f"动作 {index}（{action_type}）",)
+                    path_text = " > ".join(action_path)
+                    action_id = str(action.get("action_id") or "")
+                    if action_type == LOOP_ACTION_TYPE:
+                        loops.append((action, path_text, depth))
+                    elif action_type not in CONDITION_BRANCH_TYPES and action_id:
+                        ordinary_ids.append(action_id)
+
+                    for field, variable_name in (
+                        action.get("parameter_bindings", {}) or {}
+                    ).items():
+                        if str(variable_name) not in definitions:
+                            add_issue(
+                                preset, path_text,
+                                f"动作变量“{variable_name}”已不存在，无法用于“{field}”。",
+                                action_id,
+                            )
+
+                    if action_type == SUBMACRO_ACTION_TYPE:
+                        target_id = str(action.get("preset_id") or "")
+                        target = presets_by_id.get(target_id)
+                        if target is None:
+                            add_issue(
+                                preset, path_text,
+                                "调用的子宏目标不存在。请重新选择要调用的预设。",
+                                action_id,
+                            )
+                        else:
+                            calls_by_source[preset_id].append(
+                                (target_id, path_text, action_id)
+                            )
+                            target_parameters = {
+                                str(item.get("name") or "")
+                                for item in target.get("parameters", []) or []
+                                if isinstance(item, dict)
+                            }
+                            for name in (
+                                action.get("parameter_values", {}) or {}
+                            ):
+                                if str(name) not in target_parameters:
+                                    add_issue(
+                                        preset, path_text,
+                                        f"子宏变量“{name}”已不在目标预设中定义。",
+                                        action_id,
+                                    )
+                    walk(action.get("children", []), action_path, depth + 1)
+                if ordinary_ids:
+                    sibling_sequences.append(ordinary_ids)
+
+            walk(preset.get("actions", []) or [])
+            position_map = {
+                action_id: (sequence_index, position)
+                for sequence_index, sequence in enumerate(sibling_sequences)
+                for position, action_id in enumerate(sequence)
+            }
+            claimed_ids = set()
+            for loop, path_text, depth in loops:
+                loop_id = str(loop.get("action_id") or loop.get("id") or "")
+                target_ids = [
+                    str(value) for value in loop.get("target_action_ids", []) or []
+                    if str(value)
+                ]
+                if depth:
+                    add_issue(
+                        preset, path_text,
+                        "循环卡必须位于预设最外层，不能作为子动作。",
+                        loop_id,
+                    )
+                    continue
+                missing = [value for value in target_ids if value not in position_map]
+                if missing:
+                    add_issue(
+                        preset, path_text,
+                        "循环卡引用了已删除或不存在的动作。",
+                        loop_id,
+                    )
+                    continue
+                if not target_ids:
+                    add_issue(
+                        preset, path_text, "循环卡尚未选择引用动作。", loop_id
+                    )
+                    continue
+                sequence_index, start = position_map[target_ids[0]]
+                sequence = sibling_sequences[sequence_index]
+                if any(
+                    position_map[value][0] != sequence_index for value in target_ids
+                ) or sequence[start:start + len(target_ids)] != target_ids:
+                    add_issue(
+                        preset, path_text,
+                        "循环卡引用的动作必须位于同一层级且连续。",
+                        loop_id,
+                    )
+                elif claimed_ids.intersection(target_ids):
+                    add_issue(
+                        preset, path_text,
+                        "循环卡与其他循环卡引用范围重叠。", loop_id,
+                    )
+                claimed_ids.update(target_ids)
+
+        visiting = []
+        visited = set()
+        reported_cycles = set()
+
+        def visit(preset_id):
+            if preset_id in visiting:
+                start = visiting.index(preset_id)
+                cycle = visiting[start:] + [preset_id]
+                signature = tuple(sorted(cycle[:-1]))
+                if signature not in reported_cycles:
+                    reported_cycles.add(signature)
+                    names = [
+                        str(presets_by_id[value].get("name") or "未命名预设")
+                        for value in cycle
+                    ]
+                    source_id = visiting[-1]
+                    edge = next(
+                        (item for item in calls_by_source[source_id]
+                         if item[0] == preset_id),
+                        (preset_id, "子宏调用", ""),
+                    )
+                    add_issue(
+                        presets_by_id[source_id], edge[1],
+                        "子宏调用形成循环：" + " → ".join(names) + "。",
+                        edge[2],
+                    )
+                return
+            if preset_id in visited:
+                return
+            visiting.append(preset_id)
+            for target_id, _path, _action_id in calls_by_source[preset_id]:
+                visit(target_id)
+            visiting.pop()
+            visited.add(preset_id)
+
+        for preset_id in presets_by_id:
+            visit(preset_id)
+        return issues
+
+    def open_preset_health_check(self, card=None):
+        """Inspect the currently editable preset scope and locate findings."""
+        card = card or self.selected_preset_card
+        if card is None:
+            return
+        self.select_preset_card(card)
+        presets = [
+            {
+                "id": str(other.preset_id),
+                "name": other.name.text().strip() or "未命名预设",
+                "parameters": self._preset_parameter_definitions(other),
+                "actions": self.collect_visible_actions(other),
+            }
+            for other in self.preset_cards
+        ]
+        issues = self._preset_health_issues_from_data(presets)
+        dialog = QDialog(getattr(card, "action_dialog", None) or self)
+        dialog.setWindowTitle("方案健康检查")
+        dialog.resize(900, 560)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
+            "检查子宏引用、变量引用与循环卡范围。"
+            + (f"发现 {len(issues)} 个需要处理的问题。" if issues else "当前预设方案没有发现问题。")
+        )
+        summary.setWordWrap(True)
+        summary.setObjectName("muted")
+        layout.addWidget(summary)
+        tree = QTreeWidget()
+        tree.setObjectName("presetHealthCheck")
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["状态", "预设", "动作位置", "检查结果"])
+        tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        layout.addWidget(tree, 1)
+        if issues:
+            for issue in issues:
+                row = QTreeWidgetItem([
+                    "需要处理", issue["preset_name"], issue["path"],
+                    issue["description"],
+                ])
+                row.setData(0, Qt.ItemDataRole.UserRole, issue["preset_id"])
+                row.setData(1, Qt.ItemDataRole.UserRole, issue["action_id"])
+                tree.addTopLevelItem(row)
+        else:
+            tree.addTopLevelItem(QTreeWidgetItem([
+                "通过", "当前编辑方案", "—", "子宏、变量与循环引用均正常。",
+            ]))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        locate = QPushButton("定位问题")
+        locate.setObjectName("secondary")
+        locate.setEnabled(bool(issues))
+        buttons.addButton(locate, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(dialog.reject)
+
+        def locate_selected():
+            row = tree.currentItem()
+            if row is None:
+                return
+            preset_id = str(row.data(0, Qt.ItemDataRole.UserRole) or "")
+            action_id = str(row.data(1, Qt.ItemDataRole.UserRole) or "")
+            target_card = next(
+                (other for other in self.preset_cards
+                 if str(other.preset_id) == preset_id),
+                None,
+            )
+            if target_card is not None and self._focus_submacro_overview_action(
+                target_card, action_id
+            ):
                 dialog.accept()
 
         locate.clicked.connect(locate_selected)

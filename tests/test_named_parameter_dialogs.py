@@ -373,6 +373,35 @@ class NamedParameterDialogTests(unittest.TestCase):
             lambda: harness.open_submacro_call_overview(root), inspect_overview
         )
 
+    def test_health_check_reports_and_locates_missing_submacro_target(self):
+        harness = _DialogHarness()
+        root = _card("root")
+        harness.preset_cards.append(root)
+        call = harness.add_action({
+            "action_id": "missing-call", "type": "调用子宏",
+            "preset_id": "missing", "repeat_count": 1,
+            "speed_percent": 100, "children": [],
+        }, save=False, card=root)
+
+        def inspect_health_check(dialog):
+            tree = dialog.findChild(QTreeWidget, "presetHealthCheck")
+            self.assertIsNotNone(tree)
+            self.assertEqual(tree.topLevelItemCount(), 1)
+            issue = tree.topLevelItem(0)
+            self.assertEqual(issue.text(0), "需要处理")
+            self.assertIn("调用的子宏目标不存在", issue.text(3))
+            tree.setCurrentItem(issue)
+            locate = next(
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == "定位问题"
+            )
+            locate.click()
+            self.assertIs(root.action_table.currentItem(), call)
+
+        self.run_dialog_action(
+            lambda: harness.open_preset_health_check(root), inspect_health_check
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

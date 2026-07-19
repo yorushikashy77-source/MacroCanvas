@@ -48,6 +48,37 @@ def _preset(preset_id, actions, parameters=None):
 
 
 class NamedParameterSchemaTests(unittest.TestCase):
+    def test_preset_health_check_uses_names_and_action_locations(self):
+        issues = EditorWorkflowMixin._preset_health_issues_from_data([
+            {
+                "id": "root", "name": "主方案", "parameters": [],
+                "actions": [{
+                    "action_id": "call-child", "type": "调用子宏",
+                    "preset_id": "child", "parameter_values": {"旧变量": "B"},
+                }],
+            },
+            {
+                "id": "child", "name": "子方案", "parameters": [],
+                "actions": [{
+                    "action_id": "call-root", "type": "调用子宏",
+                    "preset_id": "root",
+                }],
+            },
+        ])
+        descriptions = [item["description"] for item in issues]
+        self.assertTrue(any(
+            "子宏变量“旧变量”已不在目标预设中定义" in value
+            for value in descriptions
+        ))
+        self.assertTrue(any(
+            "主方案 → 子方案 → 主方案" in value
+            or "子方案 → 主方案 → 子方案" in value
+            for value in descriptions
+        ))
+        cycle = next(item for item in issues if "调用形成循环" in item["description"])
+        self.assertIn("动作 1（调用子宏）", cycle["path"])
+        self.assertTrue(cycle["action_id"])
+
     def test_submacro_variable_usage_identifies_affected_action_fields(self):
         usages = EditorWorkflowMixin._submacro_parameter_usage_details([
             {
