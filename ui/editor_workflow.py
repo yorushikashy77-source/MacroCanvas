@@ -356,6 +356,24 @@ class EditorWorkflowMixin:
             )
         return True
 
+    def clear_runtime_debug_breakpoints(self):
+        """Remove session-only breakpoints and refresh their action markers."""
+        breakpoints = set(
+            getattr(self, "runtime_debug_breakpoints", set()) or set()
+        )
+        self.runtime_debug_breakpoints = set()
+        controller = getattr(self, "macro_controller", None)
+        if controller is not None:
+            controller.set_debug_breakpoints(set())
+        if not breakpoints:
+            return False
+        for card in getattr(self, "preset_cards", []):
+            if not getattr(card, "_actions_loaded", False):
+                continue
+            for item in card.action_table.iter_items():
+                self._update_action_variable_marker(item, card)
+        return True
+
     def _prune_runtime_debug_breakpoints(
         self, card=None, removed_preset_id="",
     ):

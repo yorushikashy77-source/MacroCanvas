@@ -572,6 +572,14 @@ class RuntimeDiagnosticsMixin:
         def finished(_result=0):
             timer.stop()
             cancel_pending_command()
+            clear_breakpoints = getattr(
+                self, "clear_runtime_debug_breakpoints", None
+            )
+            if callable(clear_breakpoints):
+                clear_breakpoints()
+            else:
+                self.runtime_debug_breakpoints = set()
+                self.macro_controller.set_debug_breakpoints(set())
             self.runtime_debug_enabled = False
             self.runtime_debug_dialog = None
             self.macro_controller.set_debug_enabled(False)

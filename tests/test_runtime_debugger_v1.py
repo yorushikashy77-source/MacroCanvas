@@ -544,6 +544,15 @@ class RuntimeDebuggerQtTests(unittest.TestCase):
         self.assertIn("●", item.text(0))
         self.assertEqual(harness.debugger_open_count, 1)
 
+        self.assertTrue(harness.clear_runtime_debug_breakpoints())
+        self.assertEqual(harness.runtime_debug_breakpoints, set())
+        self.assertEqual(
+            harness.macro_controller._debug_snapshot()["breakpoints"], set()
+        )
+        self.assertNotIn("●", item.text(0))
+
+        self.assertTrue(harness.toggle_selected_action_breakpoints(card))
+
         harness.runtime_debug_current_action = {
             "source_preset_id": "root", "action_id": "first",
         }
@@ -599,8 +608,12 @@ class RuntimeDebuggerQtTests(unittest.TestCase):
             harness.runtime_debug_dialog.close()
             self.app.processEvents()
             self.assertFalse(harness.runtime_debug_enabled)
+            self.assertEqual(harness.runtime_debug_breakpoints, set())
             self.assertFalse(
                 harness.macro_controller._debug_snapshot()["enabled"]
+            )
+            self.assertEqual(
+                harness.macro_controller._debug_snapshot()["breakpoints"], set()
             )
             self.assertTrue(task.wait_for_exit(timeout=1.5))
             self.assertEqual(sent, [("A", "Press"), ("A", "Release")])
