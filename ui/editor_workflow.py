@@ -143,6 +143,16 @@ class EditorWorkflowMixin:
             kind.addItems(PARAMETER_TYPES)
             kind.setCurrentText(str(definition.get("type") or PARAMETER_INPUT))
             table.setCellWidget(row, 1, kind)
+            # The global input style adds vertical padding and margins.  Qt's
+            # default table row is shorter than the resulting editor size hint,
+            # which clips both the combo text and in-place item editors.
+            table.setRowHeight(
+                row,
+                max(
+                    kind.sizeHint().height() + 8,
+                    table.fontMetrics().height() + 24,
+                ),
+            )
             table.setItem(
                 row, 2,
                 QTableWidgetItem(str(definition.get("default", "A"))),

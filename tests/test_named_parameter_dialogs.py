@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 
 from ui.editors import ActionTreeWidget
 from ui.editor_workflow import EditorWorkflowMixin
+from ui.styles import STYLESHEET
 
 
 class _DialogHarness(EditorWorkflowMixin):
@@ -125,6 +126,38 @@ class NamedParameterDialogTests(unittest.TestCase):
             lambda: harness.edit_preset_variables(card), change_then_cancel
         )
         self.assertEqual(card.parameter_definitions[0]["default"], "A")
+
+    def test_variable_definition_row_fits_styled_editors(self):
+        harness = _DialogHarness()
+        card = _card("child")
+        card.action_dialog.setStyleSheet(STYLESHEET)
+        harness.preset_cards.append(card)
+
+        def inspect_editor_sizes(dialog):
+            add = next(
+                button for button in dialog.findChildren(QPushButton)
+                if "添加变量" in button.text()
+            )
+            add.click()
+            table = dialog.findChild(QTableWidget)
+            combo = table.cellWidget(0, 1)
+            QApplication.processEvents()
+
+            self.assertGreaterEqual(combo.height(), combo.sizeHint().height())
+            self.assertGreaterEqual(
+                table.rowHeight(0), table.fontMetrics().height() + 24
+            )
+
+            table.editItem(table.item(0, 2))
+            QApplication.processEvents()
+            editor = table.findChild(QLineEdit)
+            self.assertIsNotNone(editor)
+            self.assertGreaterEqual(editor.height(), editor.sizeHint().height())
+            dialog.reject()
+
+        self.run_dialog_action(
+            lambda: harness.edit_preset_variables(card), inspect_editor_sizes
+        )
 
     def test_action_binding_dialog_marks_and_rebuilds_the_row(self):
         harness = _DialogHarness()
