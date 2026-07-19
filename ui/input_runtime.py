@@ -1387,6 +1387,10 @@ class InputRuntimeMixin:
             return True
 
         task = self.mapping_to_task(rule)
+        task["_history_source"] = (
+            f"快捷键 {trigger_name or trigger_token}" if trigger_name or trigger_token
+            else "映射触发"
+        )
         if down and task.get("execution_mode") != "按住循环":
             source = str(rule.get("source") or trigger_name or "")
             configured_modifiers = list(modifier_names(

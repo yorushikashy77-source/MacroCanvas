@@ -2,9 +2,13 @@
 
 import inspect
 import time
+from datetime import datetime
 
 from PySide6.QtCore import QTimer, Slot
-from PySide6.QtWidgets import QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QHeaderView, QMessageBox, QPushButton,
+    QSystemTrayIcon, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+)
 
 from core.constants import MacroState
 from ui.runtime_guards import (
@@ -15,6 +19,117 @@ from ui.runtime_guards import (
 
 class MacroControlsMixin:
     MACRO_STOP_TIMEOUT_SECONDS = 2.0
+    MACRO_RUN_HISTORY_LIMIT = 120
+
+    @staticmethod
+    def _macro_finish_summary(task):
+        reason = str(getattr(task, "finish_reason", "") or "completed")
+        labels = {
+            "completed": ("完成", "正常完成"),
+            "stopped": ("已停止", "由用户或运行状态停止"),
+            "empty": ("失败", "没有可执行动作"),
+            "runtime_limit": ("失败", "达到最长运行时间"),
+            "backend_inactive": ("失败", "输入后端不可用"),
+            "trigger_release_cancelled": ("已停止", "等待触发键释放时结束"),
+            "condition_timeout": ("失败", "等待条件超时"),
+            "submacro_unavailable": ("失败", "子宏不可用或形成循环"),
+            "action_failed": ("失败", "动作执行失败"),
+            "release_failed": ("失败", "结束时按键释放失败"),
+        }
+        return labels.get(reason, ("失败", reason))
+
+    def _record_macro_run_history(self, task, preset_id=""):
+        """Keep a short in-memory history without recording raw input events."""
+        if task is None:
+            return None
+        preset = dict(getattr(task, "preset", {}) or {})
+        task_id = str(preset.get("id") or preset_id or "")
+        if task_id.startswith("mapping:"):
+            return None
+        finished_at = time.time()
+        started_at = float(getattr(task, "history_started_at", 0.0) or finished_at)
+        status, detail = self._macro_finish_summary(task)
+        origin_id = str(preset.get("_origin_preset_id") or task_id)
+        entry = {
+            "finished_at": finished_at,
+            "preset_id": origin_id,
+            "preset_name": str(preset.get("name") or "宏任务"),
+            "source": str(
+                preset.get("_history_source") or "快捷键触发"
+            ),
+            "status": status,
+            "detail": detail,
+            "duration_ms": max(0, round((finished_at - started_at) * 1000)),
+        }
+        history = list(getattr(self, "macro_run_history", []) or [])
+        history.insert(0, entry)
+        del history[self.MACRO_RUN_HISTORY_LIMIT:]
+        self.macro_run_history = history
+        return entry
+
+    def clear_macro_run_history(self):
+        self.macro_run_history = []
+        dialog = getattr(self, "macro_run_history_dialog", None)
+        if dialog is not None:
+            dialog.close()
+
+    def open_macro_run_history(self):
+        dialog = QDialog(self)
+        self.macro_run_history_dialog = dialog
+        dialog.setWindowTitle("宏运行历史")
+        dialog.resize(920, 520)
+        layout = QVBoxLayout(dialog)
+        hint = QTreeWidget()
+        hint.setObjectName("macroRunHistory")
+        hint.setColumnCount(6)
+        hint.setHeaderLabels(["结束时间", "宏", "触发来源", "结果", "耗时", "说明"])
+        hint.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
+        hint.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hint.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hint.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hint.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hint.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hint.header().setSectionResizeMode(5, QHeaderView.Stretch)
+        history = list(getattr(self, "macro_run_history", []) or [])
+        for entry in history:
+            timestamp = datetime.fromtimestamp(entry["finished_at"]).strftime(
+                "%H:%M:%S"
+            )
+            row = QTreeWidgetItem([
+                timestamp, entry["preset_name"], entry["source"],
+                entry["status"], f"{entry['duration_ms']} ms", entry["detail"],
+            ])
+            row.setData(0, 32, entry["preset_id"])
+            hint.addTopLevelItem(row)
+        if not history:
+            hint.addTopLevelItem(QTreeWidgetItem([
+                "—", "—", "—", "暂无记录", "—",
+                "本次启动后完成的宏会显示在这里。",
+            ]))
+        layout.addWidget(hint, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        clear = QPushButton("清空")
+        clear.setObjectName("dangerGhost")
+        buttons.addButton(clear, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(dialog.reject)
+        clear.clicked.connect(self.clear_macro_run_history)
+
+        def locate_selected(*_args):
+            row = hint.currentItem()
+            preset_id = str(row.data(0, 32) or "") if row is not None else ""
+            card = next(
+                (item for item in getattr(self, "preset_cards", [])
+                 if str(item.preset_id) == preset_id),
+                None,
+            )
+            if card is not None:
+                dialog.accept()
+                self.open_preset_actions_dialog(card)
+
+        hint.itemDoubleClicked.connect(locate_selected)
+        layout.addWidget(buttons)
+        dialog.exec()
+        self.macro_run_history_dialog = None
 
     def _macro_callback_blocked_by_shutdown(self):
         """Keep delayed task callbacks from reopening output during shutdown."""
@@ -444,6 +559,7 @@ class MacroControlsMixin:
                 "宏自然结束，但最终按键释放未完成",
                 [failed_preset_name],
             )
+        self._record_macro_run_history(finished_task, preset_id)
         if self.active_macro_id == preset_id:
             with self.macro_controller.lock:
                 fallback = next(

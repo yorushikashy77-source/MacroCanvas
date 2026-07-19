@@ -3,6 +3,7 @@ import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtWidgets import QApplication
 
@@ -209,6 +210,30 @@ class InteractionLogicFixTests(unittest.TestCase):
         self.assertEqual(harness.active_macro_id, "remaining")
         self.assertEqual(harness.macro_state, MacroState.RUNNING)
         self.assertIn("任务 remaining", harness.execution_info.text)
+
+    def test_macro_run_history_keeps_macro_result_without_mapping_noise(self):
+        harness = _MacroFinishHarness([])
+        completed = SimpleNamespace(
+            preset={
+                "id": "preset-a", "name": "技能连招",
+                "_history_source": "快捷键 F1",
+            },
+            history_started_at=time.time() - 0.125,
+            finish_reason="completed",
+        )
+        entry = harness._record_macro_run_history(completed)
+        self.assertEqual(entry["preset_name"], "技能连招")
+        self.assertEqual(entry["source"], "快捷键 F1")
+        self.assertEqual(entry["status"], "完成")
+        self.assertGreaterEqual(entry["duration_ms"], 100)
+        self.assertEqual(len(harness.macro_run_history), 1)
+
+        mapping = SimpleNamespace(
+            preset={"id": "mapping:basic", "name": "基础映射"},
+            history_started_at=time.time(), finish_reason="completed",
+        )
+        self.assertIsNone(harness._record_macro_run_history(mapping))
+        self.assertEqual(len(harness.macro_run_history), 1)
 
     def test_finish_hotkey_during_countdown_does_not_cancel(self):
         harness = _RecordingHarness()

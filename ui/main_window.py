@@ -640,6 +640,8 @@ class MainWindow(
         )
         self.runtime_debug_action = settings_menu.addAction("运行调试器")
         self.runtime_debug_action.triggered.connect(self.open_runtime_debugger)
+        self.macro_run_history_action = settings_menu.addAction("宏运行历史")
+        self.macro_run_history_action.triggered.connect(self.open_macro_run_history)
         settings_menu.addSeparator()
         self.restore_config_action = settings_menu.addAction(
             "打开备份配置表"

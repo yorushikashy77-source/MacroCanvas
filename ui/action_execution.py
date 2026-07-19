@@ -115,6 +115,7 @@ class ActionExecutionMixin:
             "_origin_preset_id": origin_preset_id,
             "name": f"{preset.get('name', '预设')} · 菜单测试",
             "_required_profile_id": str(self.active_profile_id or ""),
+            "_history_source": "菜单测试",
         })
         if test_task.get("execution_mode") in (
             "按住循环", "开关循环", "无限循环"
@@ -336,6 +337,7 @@ class ActionExecutionMixin:
                 # 同时让删除预设、停止当前宏和任务状态显示都能追踪该任务。
                 "id": debug_task_id,
                 "_origin_preset_id": origin_preset_id,
+                "_history_source": "当前层测试",
                 "name": f"{preset.get('name', '预设')} · 当前层后续动作",
                 "enabled": True,
                 "execution_mode": "执行一次",

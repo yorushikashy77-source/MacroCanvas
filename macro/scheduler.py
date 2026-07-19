@@ -90,6 +90,7 @@ class MacroTask:
         self.worker_threads = set()
         self.worker_lock = threading.RLock()
         self.started_at = 0.0
+        self.history_started_at = time.time()
         self.deadline = 0.0
         self.clock_lock = threading.RLock()
         self.pause_started_at = 0.0
@@ -388,6 +389,7 @@ class MacroTask:
         return True
 
     def start(self):
+        self.history_started_at = time.time()
         self.thread.start()
 
     def stop(self):
