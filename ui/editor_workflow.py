@@ -68,18 +68,11 @@ class _TableCellLineEdit(QLineEdit):
         super().focusInEvent(event)
 
 
-class _TableCellComboBox(QComboBox):
-    """A permanent combo editor that also selects its containing row."""
-
-    def __init__(self, table):
-        super().__init__()
-        self._table_ref = weakref.ref(table)
-
-    def focusInEvent(self, event):
-        table = self._table_ref()
-        if table is not None:
-            _select_editor_table_cell(self, table)
-        super().focusInEvent(event)
+def _select_editor_table_cell_from_refs(editor_ref, table_ref):
+    editor = editor_ref()
+    table = table_ref()
+    if editor is not None and table is not None:
+        _select_editor_table_cell(editor, table)
 
 
 class EditorWorkflowMixin:
@@ -184,9 +177,16 @@ class EditorWorkflowMixin:
             )
             name.setPlaceholderText("变量名称")
             table.setCellWidget(row, 0, name)
-            kind = _TableCellComboBox(table)
+            # Keep the stock focus handling: selecting the table cell from a
+            # combo's focusInEvent interrupts mouse commits in its popup list.
+            kind = QComboBox()
             kind.addItems(PARAMETER_TYPES)
             kind.setCurrentText(str(definition.get("type") or PARAMETER_INPUT))
+            kind.activated.connect(
+                lambda _index, editor_ref=weakref.ref(kind),
+                table_ref=weakref.ref(table):
+                _select_editor_table_cell_from_refs(editor_ref, table_ref)
+            )
             table.setCellWidget(row, 1, kind)
             default = _TableCellLineEdit(
                 str(definition.get("default", "A")), table

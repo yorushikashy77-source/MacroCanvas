@@ -127,6 +127,37 @@ class NamedParameterDialogTests(unittest.TestCase):
         )
         self.assertEqual(card.parameter_definitions[0]["default"], "A")
 
+    def test_variable_type_selection_is_committed(self):
+        harness = _DialogHarness()
+        card = _card("child", [
+            {"name": "延迟", "type": "按键", "default": "A"},
+        ])
+        harness.preset_cards.append(card)
+
+        def choose_duration_from_popup(dialog):
+            table = dialog.findChild(QTableWidget)
+            combo = table.cellWidget(0, 1)
+            self.assertIs(type(combo), QComboBox)
+            duration_index = combo.findText("时长")
+            self.assertGreaterEqual(duration_index, 0)
+            combo.setCurrentIndex(duration_index)
+            combo.activated.emit(duration_index)
+            QApplication.processEvents()
+
+            self.assertEqual(combo.currentText(), "时长")
+            table.cellWidget(0, 2).setText("250")
+            _dialog_button(
+                dialog, QDialogButtonBox.StandardButton.Ok
+            ).click()
+
+        self.run_dialog_action(
+            lambda: harness.edit_preset_variables(card),
+            choose_duration_from_popup,
+        )
+        self.assertEqual(card.parameter_definitions, [{
+            "name": "延迟", "type": "时长", "default": 250,
+        }])
+
     def test_variable_definition_row_fits_styled_editors(self):
         harness = _DialogHarness()
         card = _card("child")
