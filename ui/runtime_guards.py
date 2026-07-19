@@ -1,16 +1,14 @@
 """Shared guards for runtime output cleanup and UI operation re-entry."""
 
 from core.constants import MacroState
+from ui.operation_state import operation_state_snapshot
 
 
 def runtime_transaction_busy(owner):
     """Return True while runtime/apply/loading/shutdown transactions are active."""
-    return bool(
-        getattr(owner, "_shutdown_started", False)
-        or getattr(owner, "_runtime_operation_active", False)
-        or getattr(owner, "_config_apply_transaction_active", False)
-        or getattr(owner, "loading_task_stack", [])
-    )
+    return operation_state_snapshot(owner).key in {
+        "shutdown", "runtime_change", "applying", "loading",
+    }
 
 
 def macro_control_transaction_busy(owner):

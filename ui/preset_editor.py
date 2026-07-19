@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from config.schema import MAX_PRESETS_PER_SCOPE
 from core.constants import *
-from macro.actions import iter_action_tree
+from macro.actions import clone_action_tree, iter_action_tree
 from ui.editors import ActionTreeWidget, HotkeyEdit
 
 
@@ -31,6 +31,9 @@ class PresetEditorMixin:
             "name": f"未配置预设 {len(self.preset_cards) + 1}",
             "trigger_modifiers": "无",
             "trigger": "F1",
+            "condition_enabled": False,
+            "condition_input": "鼠标左键",
+            "condition_state": "按住时",
             "execution_mode": "执行一次",
             "loop_count": 1,
             "loop_interval_ms": 0,
@@ -43,9 +46,14 @@ class PresetEditorMixin:
         card.setObjectName("presetCard")
         card.setProperty("selected", False)
         card.preset_id = preset.get("id") or uuid.uuid4().hex
+        card.parameter_definitions = [
+            dict(definition)
+            for definition in preset.get("parameters", []) or []
+            if isinstance(definition, dict)
+        ]
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(14, 11, 14, 12)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(12, 7, 12, 8)
+        card_layout.setSpacing(5)
 
         header = QHBoxLayout()
         header.setSpacing(7)
@@ -64,6 +72,11 @@ class PresetEditorMixin:
             preset.get("trigger_modifiers", "无"),
             preset.get("trigger", "F1"),
             TRIGGER_NAMES,
+            allow_condition=True,
+            condition_enabled=bool(preset.get("condition_enabled", False)),
+            condition_key=preset.get("condition_input", "鼠标左键"),
+            condition_state=preset.get("condition_state", "按住时"),
+            condition_options=CONDITION_INPUT_NAMES,
         )
         card.trigger_hotkey.setFixedWidth(220)
         trigger_group = self.labeled_control("触发快捷键", card.trigger_hotkey)
@@ -112,6 +125,15 @@ class PresetEditorMixin:
         )
         header.addWidget(test)
 
+        preview = QPushButton("◇ 模拟")
+        preview.setObjectName("secondary")
+        preview.setFixedWidth(88)
+        preview.setToolTip("只估算动作时间线，不发送任何键盘或鼠标输入")
+        preview.clicked.connect(
+            lambda _checked=False, c=card: self.preview_selected_preset_simulation(c)
+        )
+        header.addWidget(preview)
+
         record = QPushButton("● 录制动作")
         record.setObjectName("recordAction")
         record.setFixedWidth(104)
@@ -125,8 +147,8 @@ class PresetEditorMixin:
         card.parameter_panel = QFrame()
         card.parameter_panel.setObjectName("parameterArea")
         settings = QHBoxLayout(card.parameter_panel)
-        settings.setContentsMargins(12, 8, 12, 8)
-        settings.setSpacing(8)
+        settings.setContentsMargins(10, 6, 10, 6)
+        settings.setSpacing(6)
 
         card.loop_count = QSpinBox()
         card.loop_count.setRange(1, 100000)
@@ -200,6 +222,21 @@ class PresetEditorMixin:
         card.action_title = QLabel("动作组 · 0 组 / 0 项")
         card.action_title.setObjectName("sectionLabel")
         action_header.addWidget(card.action_title)
+        define_variables = QPushButton("定义变量")
+        define_variables.setObjectName("secondary")
+        define_variables.setToolTip("声明该预设可复用的按键、整数或时长默认值")
+        define_variables.clicked.connect(
+            lambda _checked=False, c=card: self.edit_preset_variables(c)
+        )
+        action_variables = QPushButton("动作变量")
+        action_variables.setObjectName("secondary")
+        action_variables.setToolTip("为选中动作绑定变量；选中子宏时设置调用覆盖值")
+        action_variables.clicked.connect(
+            lambda _checked=False, c=card:
+            self.edit_selected_action_variables(c)
+        )
+        action_header.addWidget(define_variables)
+        action_header.addWidget(action_variables)
         action_header.addStretch()
         up = QPushButton("↑")
         up.setToolTip("在同一层级内上移")
@@ -293,6 +330,37 @@ class PresetEditorMixin:
             "type": "等待", "target": "仅等待", "wait_ms": 500,
             "jitter_ms": 0, "children": [],
         }, card=c))
+        add_condition = QPushButton("＋ 条件")
+        add_condition.setObjectName("secondary")
+        add_condition.setToolTip("条件满足时执行其子动作，否则跳过")
+        add_condition.clicked.connect(
+            lambda _checked=False, c=card: self.add_action_from_menu({
+                "type": CONDITION_ACTION_TYPE,
+                "condition_input": "鼠标左键",
+                "condition_state": "按住时",
+                "children": [],
+            }, card=c)
+        )
+        add_wait_condition = QPushButton("＋ 等条件")
+        add_wait_condition.setObjectName("secondary")
+        add_wait_condition.setToolTip("等到指定输入状态；超时后结束当前宏")
+        add_wait_condition.clicked.connect(
+            lambda _checked=False, c=card: self.add_action_from_menu({
+                "type": WAIT_CONDITION_ACTION_TYPE,
+                "condition_input": "鼠标左键",
+                "condition_state": "按住时",
+                "timeout_ms": 5000,
+                "poll_ms": 20,
+                "children": [],
+            }, card=c)
+        )
+        add_submacro = QPushButton("＋ 子宏")
+        add_submacro.setObjectName("secondary")
+        add_submacro.setToolTip("调用同一配置方案中的另一个预设，可调整次数和速度")
+        add_submacro.clicked.connect(
+            lambda _checked=False, c=card:
+            self.add_submacro_action_from_menu(c)
+        )
         for button in (
             up, down, duplicate, card.undo_button, card.redo_button,
             organize, delete_selected,
@@ -308,6 +376,15 @@ class PresetEditorMixin:
         for button in (add_key, add_mouse, add_wheel, add_wait):
             action_insert_header.addWidget(button)
         action_layout.addLayout(action_insert_header)
+
+        control_insert_header = QHBoxLayout()
+        control_hint = QLabel("流程控制")
+        control_hint.setObjectName("muted")
+        control_insert_header.addWidget(control_hint)
+        control_insert_header.addStretch(1)
+        for button in (add_condition, add_wait_condition, add_submacro):
+            control_insert_header.addWidget(button)
+        action_layout.addLayout(control_insert_header)
 
         card.action_table = ActionTreeWidget()
         card.action_table.setObjectName("actionTable")
@@ -361,6 +438,12 @@ class PresetEditorMixin:
             "时间型动作可设置随机 ± 浮动，每次执行都会重新取值。"
             "“整理动作”可压缩同层级的密集鼠标轨迹和连续滚轮，并保留循环引用目标。"
             "“插入循环点位”会在方案最下方添加一个独立循环卡片，引用所选范围但不移动原动作。"
+            "“条件”只在满足时执行其子动作；“等条件”超时会结束当前宏。"
+            "条件动作下的“条件成立”和“否则”是固定分支；"
+            "选中分支后使用上方按钮添加动作，也可在两个分支间拖动普通动作。"
+            "“子宏”可调用同一配置方案中的其他预设，并单独设置次数与速度。"
+            "“定义变量”可声明按键、整数和时长默认值；“动作变量”可让选中动作引用变量，"
+            "或在调用子宏时覆盖目标预设的默认值。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("muted")
@@ -417,6 +500,11 @@ class PresetEditorMixin:
         self.update_card_action_summary(card)
         self.update_preset_action_dialog_title(card)
         self.select_preset_card(card)
+        if (
+            not getattr(self, "initializing", False)
+            and hasattr(self, "refresh_preset_filters")
+        ):
+            self.refresh_preset_filters()
         self._loading_checkpoint(force=True)
         self.data_changed()
 
@@ -479,6 +567,7 @@ class PresetEditorMixin:
         self.select_preset_card(card)
         if not self._ensure_preset_actions_loaded(card):
             return
+        self.refresh_submacro_target_editors(card)
         self.update_preset_action_dialog_title(card)
         self.update_card_action_summary(card)
 
@@ -537,6 +626,8 @@ class PresetEditorMixin:
     def preset_card_changed(self, card):
         self.select_preset_card(card)
         self.update_preset_action_dialog_title(card)
+        if hasattr(self, "refresh_preset_filters"):
+            self.refresh_preset_filters()
         self.data_changed()
 
     def select_preset_card(self, card):
@@ -674,6 +765,31 @@ class PresetEditorMixin:
 
         preset_id = card.preset_id
         preset_name = card.name.text().strip() or "未命名预设"
+        referrers = []
+        for other in self.preset_cards:
+            if other is card:
+                continue
+            actions = (
+                self.collect_visible_actions(other)
+                if getattr(other, "_actions_loaded", False)
+                else clone_action_tree(getattr(other, "_pending_actions", []) or [])
+            )
+            if any(
+                action.get("type") == SUBMACRO_ACTION_TYPE
+                and str(action.get("preset_id") or "") == str(preset_id or "")
+                for action in iter_action_tree(actions)
+            ):
+                referrers.append(other.name.text().strip() or "未命名预设")
+        if referrers:
+            QMessageBox.information(
+                self,
+                "预设正在被子宏调用",
+                f"“{preset_name}”正被以下预设调用：\n"
+                + "、".join(referrers[:8])
+                + ("\n等其他预设" if len(referrers) > 8 else "")
+                + "\n\n请先删除这些“调用子宏”动作，再删除该预设。",
+            )
+            return
 
         confirm = QMessageBox(self)
         confirm.setIcon(QMessageBox.Icon.Warning)
@@ -718,6 +834,8 @@ class PresetEditorMixin:
             self.action_title = None
 
         self.data_changed()
+        if hasattr(self, "refresh_preset_filters"):
+            self.refresh_preset_filters()
         self.engine_hint.setStyleSheet("")
         self.engine_hint.setText(
             f"已删除“{preset_name}”；运行触发已暂停，应用更改后写入配置"

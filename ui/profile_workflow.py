@@ -255,6 +255,8 @@ class ProfileWorkflowMixin:
                 if target is not None:
                     target.setUpdatesEnabled(True)
                     target.update()
+        self.refresh_mapping_filters()
+        self.refresh_preset_filters()
 
         self.editor_loaded_profile_id = str(
             self.editor_profile_id if profile_id is None else profile_id or ""
@@ -347,6 +349,8 @@ class ProfileWorkflowMixin:
                 if target is not None:
                     target.setUpdatesEnabled(True)
                     target.update()
+        self.refresh_mapping_filters()
+        self.refresh_preset_filters()
         self.refresh_profile_selector()
         return self.current_config_payload()
 
@@ -1077,8 +1081,14 @@ class ProfileWorkflowMixin:
                     preset.get("actions", [])
                 )
                 self.runtime_presets.append(copied)
+            runtime_library = {
+                str(preset.get("id")): preset
+                for preset in self.runtime_presets if preset.get("id")
+            }
+            for preset in self.runtime_presets:
+                preset["_preset_library"] = runtime_library
                 self.runtime_trigger_rules.append(
-                    self._preset_as_mapping_rule(copied)
+                    self._preset_as_mapping_rule(preset)
                 )
         return True
 

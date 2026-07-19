@@ -46,8 +46,8 @@ class MappingEditorMixin:
         card.setObjectName("mappingCard")
         card.mapping_id = rule.get("id") or uuid.uuid4().hex
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(14, 11, 14, 11)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(12, 7, 12, 7)
+        card_layout.setSpacing(5)
 
         summary = QHBoxLayout()
         summary.setSpacing(7)
@@ -76,7 +76,7 @@ class MappingEditorMixin:
             condition_enabled=bool(rule.get("condition_enabled", False)),
             condition_key=rule.get("condition_input", "鼠标左键"),
             condition_state=rule.get("condition_state", "按住时"),
-            condition_options=SOURCE_NAMES,
+            condition_options=CONDITION_INPUT_NAMES,
         )
         card.source_hotkey.setFixedWidth(185)
         source_group = self.labeled_control("来源快捷键", card.source_hotkey)
@@ -133,8 +133,8 @@ class MappingEditorMixin:
         card.parameter_panel = QFrame()
         card.parameter_panel.setObjectName("parameterArea")
         settings = QHBoxLayout(card.parameter_panel)
-        settings.setContentsMargins(12, 8, 12, 8)
-        settings.setSpacing(8)
+        settings.setContentsMargins(10, 6, 10, 6)
+        settings.setSpacing(6)
 
         card.hold = QSpinBox()
         card.hold.setRange(1, 600_000)
@@ -205,7 +205,10 @@ class MappingEditorMixin:
             max(0, self.mapping_layout.count() - 1), card
         )
 
-        changed = lambda *_args: self.data_changed()
+        def changed(*_args):
+            if hasattr(self, "refresh_mapping_filters"):
+                self.refresh_mapping_filters()
+            self.data_changed()
         card.enabled.stateChanged.connect(changed)
         card.name.textChanged.connect(changed)
         card.source_hotkey.changed.connect(changed)
@@ -226,6 +229,11 @@ class MappingEditorMixin:
 
         self.refresh_mapping_parameter_panel(card)
         self.refresh_mapping_priority_labels()
+        if (
+            not getattr(self, "initializing", False)
+            and hasattr(self, "refresh_mapping_filters")
+        ):
+            self.refresh_mapping_filters()
         self._loading_checkpoint()
         self.data_changed()
 
@@ -548,6 +556,8 @@ class MappingEditorMixin:
         card.hide()
         card.deleteLater()
         self.data_changed()
+        if hasattr(self, "refresh_mapping_filters"):
+            self.refresh_mapping_filters()
 
     @staticmethod
     def update_mapping_mode_fields(*_args):

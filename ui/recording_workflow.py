@@ -226,6 +226,11 @@ class RecordingWorkflowMixin:
         queued to the GUI thread.  The direct fallback is only for lightweight
         non-Qt test harnesses.
         """
+        if getattr(self, "_shutdown_started", False):
+            self.recording_restore_pending = False
+            self.recording_workflow_complete = False
+            self.recording_restore_layer = None
+            return False
         signal = getattr(self, "recording_restore_signal", None)
         if signal is not None:
             signal.emit()
@@ -234,6 +239,12 @@ class RecordingWorkflowMixin:
 
     def _complete_recording_restore_if_ready(self):
         """Restore mappings only after workflow completion and control KeyUp."""
+        if getattr(self, "_shutdown_started", False):
+            self.recording_restore_pending = False
+            self.recording_workflow_complete = False
+            self.recording_session_active = False
+            self.recording_restore_layer = None
+            return False
         if not getattr(self, "recording_restore_pending", False):
             return False
         if not getattr(self, "recording_workflow_complete", False):
@@ -387,6 +398,9 @@ class RecordingWorkflowMixin:
         self.begin_recording_countdown(countdown.value())
 
     def begin_recording_countdown(self, seconds):
+        cancel_countdown = getattr(self, "_cancel_manual_test_countdown", None)
+        if callable(cancel_countdown):
+            cancel_countdown("已开始录制，原测试倒计时已取消")
         self.recording_guard_profile_id = str(self.editor_profile_id or "")
         # 游戏模式直接复用 Interception 输入源录制；普通模式才需要
         # Windows 低级钩子观察键鼠事件。

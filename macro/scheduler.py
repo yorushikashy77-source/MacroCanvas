@@ -4,7 +4,14 @@ import time
 
 from PySide6.QtCore import QObject, Signal
 
-from core.constants import MOUSE_NAMES
+from core.constants import (
+    CONDITION_ACTION_TYPE, CONDITION_BRANCH_TYPES,
+    CONDITION_ELSE_BRANCH_TYPE, CONDITION_TRUE_BRANCH_TYPE,
+    CONTROL_ACTION_TYPES, MOUSE_NAMES, SUBMACRO_ACTION_TYPE,
+    WAIT_CONDITION_ACTION_TYPE,
+)
+from macro.actions import clone_action_tree
+from macro.parameters import resolve_action_parameters
 from engine.window_context import (
     foreground_window_identity,
     foreground_window_identity_matches,
@@ -27,9 +34,17 @@ class MacroTask:
     def __init__(
         self, preset, engine, signals,
         expect_output=None, send_output=None, is_active=None,
-        profile_active=None, quarantine_release=None,
+        profile_active=None, quarantine_release=None, condition_state=None,
     ):
-        self.preset = preset
+        # Resolve root defaults before action IDs and loop references are
+        # indexed. Presets without named parameters retain the legacy action
+        # path and avoid an unnecessary deep copy on every trigger.
+        self.preset = dict(preset)
+        self.preset["actions"] = (
+            resolve_action_parameters(preset.get("actions", []), preset)
+            if preset.get("parameters")
+            else preset.get("actions", [])
+        )
         self.engine = engine
         self.signals = signals
         self.expect_output = expect_output
@@ -40,6 +55,7 @@ class MacroTask:
         self.is_active = is_active or self.engine.is_running
         self.profile_active = profile_active
         self.quarantine_release = quarantine_release
+        self.condition_state = condition_state
         self.stop_event = threading.Event()
         self.run_event = threading.Event()
         self.run_event.set()
@@ -118,13 +134,14 @@ class MacroTask:
                 targets.append(target)
         return targets
 
-    def _matching_loop(self, actions, index):
+    def _matching_loop(self, actions, index, controls_by_start=None):
         if not 0 <= index < len(actions):
             return None, []
         first_id = str(actions[index].get("action_id") or "")
         if not first_id:
             return None, []
-        for loop_action in self.loop_controls_by_start.get(first_id, []):
+        controls_by_start = controls_by_start or self.loop_controls_by_start
+        for loop_action in controls_by_start.get(first_id, []):
             target_ids = [
                 str(value)
                 for value in loop_action.get("target_action_ids", []) or []
@@ -142,8 +159,19 @@ class MacroTask:
         local_stop=None, progress_callback=None,
     ):
         local_stop = local_stop or self.stop_event
+        raw_actions = list(actions or [])
+        local_controls = {}
+        for control in raw_actions:
+            if control.get("type") != LOOP_ACTION_TYPE:
+                continue
+            target_ids = [
+                str(value) for value in control.get("target_action_ids", []) or []
+                if value
+            ]
+            if target_ids:
+                local_controls.setdefault(target_ids[0], []).append(control)
         actions = [
-            action for action in actions or []
+            action for action in raw_actions
             if action.get("type") != LOOP_ACTION_TYPE
         ]
         if timeline_mode == "parallel":
@@ -162,7 +190,9 @@ class MacroTask:
             while index < len(actions):
                 if local_stop.is_set() or self.stop_event.is_set() or not self.wait_ready():
                     return False
-                loop_action, segment = self._matching_loop(actions, index)
+                loop_action, segment = self._matching_loop(
+                    actions, index, local_controls
+                )
                 if loop_action is not None:
                     if progress_callback:
                         progress_callback(index, loop_action, len(actions), {"loop_segment_total": len(segment)})
@@ -206,7 +236,9 @@ class MacroTask:
         while index < len(actions):
             if local_stop.is_set() or self.stop_event.is_set() or not self.wait_ready():
                 return False
-            loop_action, segment = self._matching_loop(actions, index)
+            loop_action, segment = self._matching_loop(
+                actions, index, local_controls
+            )
             if loop_action is not None:
                 if progress_callback:
                     progress_callback(index, loop_action, len(actions), {"loop_segment_total": len(segment)})
@@ -742,6 +774,8 @@ class MacroTask:
     def run_action(self, action, speed):
         self._emit_action_activity(action)
         kind = action.get("type")
+        if kind in CONTROL_ACTION_TYPES:
+            return False
         scale = 100 / max(10, speed)
         if kind == "等待":
             duration = self.jittered_milliseconds(
@@ -821,8 +855,11 @@ class MacroTask:
         # Always resolve loop contents through current action IDs. Loop cards do
         # not own parameter snapshots, so edits to the original actions are the
         # single source of truth for every subsequent loop execution.
+        dynamic_targets = targets is None
         resolved_targets = self._resolve_loop_targets(action)
-        targets = resolved_targets or (list(targets) if targets is not None else [])
+        targets = (
+            list(targets) if targets is not None else resolved_targets
+        )
         if not targets:
             return True
         self._emit_action_activity(action)
@@ -847,7 +884,7 @@ class MacroTask:
             if local_stop.is_set() or self.stop_event.is_set() or not self.wait_ready():
                 return False
             latest_targets = self._resolve_loop_targets(action)
-            if latest_targets:
+            if dynamic_targets and latest_targets:
                 targets = latest_targets
             if max_seconds and self.active_elapsed() - started >= max_seconds:
                 break
@@ -910,11 +947,152 @@ class MacroTask:
             action, parent_speed, threading.Event()
         )
 
+    def _condition_satisfied(self, action):
+        callback = self.condition_state
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback(
+                action.get("condition_input", ""),
+                action.get("condition_state", "按住时"),
+            ))
+        except Exception:
+            return False
+
+    def _wait_for_trigger_release(self):
+        """Fence one-shot output until its physical trigger chord is released."""
+        inputs = tuple(dict.fromkeys(
+            str(value) for value in (
+                self.preset.get("_trigger_release_inputs", []) or []
+            ) if str(value)
+        ))
+        if not inputs or not callable(self.condition_state):
+            return True
+        while not self.stop_event.is_set():
+            if not self.wait_ready():
+                return False
+            if not any(self._condition_satisfied({
+                "condition_input": input_name,
+                "condition_state": "按住时",
+            }) for input_name in inputs):
+                return True
+            if self.stop_event.wait(0.005):
+                return False
+        return False
+
+    @staticmethod
+    def condition_branch_actions(action):
+        """Return true/false branch actions, accepting legacy true-only data."""
+        children = list(action.get("children", []) or [])
+        branches = {
+            child.get("type"): child.get("children", []) or []
+            for child in children
+            if child.get("type") in CONDITION_BRANCH_TYPES
+        }
+        if branches:
+            return (
+                list(branches.get(CONDITION_TRUE_BRANCH_TYPE, [])),
+                list(branches.get(CONDITION_ELSE_BRANCH_TYPE, [])),
+            )
+        return children, []
+
+    def _wait_for_condition(self, action):
+        timeout_ms = max(0, int(action.get("timeout_ms", 0)))
+        poll_ms = max(10, min(1_000, int(action.get("poll_ms", 20))))
+        started = self.active_elapsed()
+        while not self.stop_event.is_set():
+            if not self.wait_ready() or not self.is_active():
+                return False
+            if self._condition_satisfied(action):
+                return True
+            if timeout_ms and (self.active_elapsed() - started) * 1000 >= timeout_ms:
+                return False
+            if self.stop_event.wait(poll_ms / 1000):
+                return False
+        return False
+
+    @staticmethod
+    def _mark_submacro_call_stack(actions, stack):
+        copied = clone_action_tree(actions)
+        pending = list(copied)
+        while pending:
+            action = pending.pop()
+            if action.get("type") == SUBMACRO_ACTION_TYPE:
+                action["_call_stack"] = tuple(stack)
+            pending.extend(action.get("children", []) or [])
+        return copied
+
+    def _run_submacro(self, action, parent_speed):
+        library = self.preset.get("_preset_library", {})
+        target_id = str(action.get("preset_id") or "")
+        target = library.get(target_id) if isinstance(library, dict) else None
+        stack = tuple(action.get("_call_stack") or (self.preset.get("id"),))
+        if not target or not target_id or target_id in stack or len(stack) >= 16:
+            return False
+        repeat_count = max(1, min(100_000, int(action.get("repeat_count", 1))))
+        local_speed = max(10, min(500, int(action.get("speed_percent", 100))))
+        effective_speed = max(
+            10, min(500, round(parent_speed * local_speed / 100))
+        )
+        resolved_actions = (
+            resolve_action_parameters(
+                target.get("actions", []), target,
+                action.get("parameter_values", {}),
+            )
+            if target.get("parameters")
+            else target.get("actions", [])
+        )
+        called_actions = self._mark_submacro_call_stack(
+            resolved_actions, stack + (target_id,)
+        )
+        self._emit_action_activity(action, extra=target.get("name", target_id))
+        for _index in range(repeat_count):
+            if not self._run_action_sequence(
+                called_actions, effective_speed, timeline_mode="sequential",
+                local_stop=self.stop_event,
+            ):
+                return False
+        return True
+
     def run_action_group(self, root_action, speed):
         """Run one action and its child timeline, applying referenced loops in place."""
         if root_action.get("type") == LOOP_ACTION_TYPE:
             # Loop cards are control metadata and are never normal action nodes.
             return True
+        kind = root_action.get("type")
+        if kind == CONDITION_ACTION_TYPE:
+            self._emit_action_activity(root_action)
+            true_actions, else_actions = self.condition_branch_actions(
+                root_action
+            )
+            selected_actions = (
+                true_actions if self._condition_satisfied(root_action)
+                else else_actions
+            )
+            return self._run_action_sequence(
+                selected_actions, speed,
+                timeline_mode="sequential", local_stop=self.stop_event,
+            )
+        if kind in CONDITION_BRANCH_TYPES:
+            return self._run_action_sequence(
+                root_action.get("children", []) or [], speed,
+                timeline_mode="sequential", local_stop=self.stop_event,
+            )
+        if kind == WAIT_CONDITION_ACTION_TYPE:
+            self._emit_action_activity(root_action)
+            if not self._wait_for_condition(root_action):
+                return False
+            return self._run_action_sequence(
+                root_action.get("children", []) or [], speed,
+                timeline_mode="sequential", local_stop=self.stop_event,
+            )
+        if kind == SUBMACRO_ACTION_TYPE:
+            if not self._run_submacro(root_action, speed):
+                return False
+            return self._run_action_sequence(
+                root_action.get("children", []) or [], speed,
+                timeline_mode="sequential", local_stop=self.stop_event,
+            )
 
         workers = []
         results = []
@@ -966,6 +1144,27 @@ class MacroTask:
             else:
                 detail = "无限循环"
             return f"{action.get('name', '循环项目')}（{detail}）"
+        if kind == CONDITION_ACTION_TYPE:
+            return (
+                f"条件分支：{action.get('condition_input', '')} "
+                f"{action.get('condition_state', '按住时')}"
+            )
+        if kind == CONDITION_TRUE_BRANCH_TYPE:
+            return "条件成立分支"
+        if kind == CONDITION_ELSE_BRANCH_TYPE:
+            return "否则分支"
+        if kind == WAIT_CONDITION_ACTION_TYPE:
+            timeout = max(0, int(action.get("timeout_ms", 0)))
+            suffix = f"，超时 {timeout}ms" if timeout else "，一直等待"
+            return (
+                f"等待 {action.get('condition_input', '')} "
+                f"{action.get('condition_state', '按住时')}{suffix}"
+            )
+        if kind == SUBMACRO_ACTION_TYPE:
+            return (
+                f"调用子宏 {action.get('preset_id', '')} ×"
+                f"{max(1, int(action.get('repeat_count', 1)))}"
+            )
         if kind == "等待":
             jitter = max(0, int(action.get("jitter_ms", 0)))
             suffix = f" ±{jitter}ms" if jitter else ""
@@ -992,11 +1191,15 @@ class MacroTask:
         interval = int(self.preset.get("loop_interval_ms", 0))
         interval_jitter = int(self.preset.get("loop_interval_jitter_ms", 0))
         max_seconds = int(self.preset.get("max_runtime_s", 0))
-        self.started_at = time.perf_counter()
-        self.deadline = float(max_seconds) if max_seconds else 0.0
         try:
             if not actions or not self.is_active():
                 return
+            if not self._wait_for_trigger_release():
+                return
+            # Trigger-release waiting is input isolation, not macro runtime. Do
+            # not charge it against finite runtime or action timing.
+            self.started_at = time.perf_counter()
+            self.deadline = float(max_seconds) if max_seconds else 0.0
             for loop_index in range(1, max(1, loops) + 1):
                 if self.stop_event.is_set() or not self.is_active():
                     break
@@ -1067,7 +1270,7 @@ class MacroTask:
 class MacroController:
     def __init__(
         self, engine, expect_output=None, send_output=None, is_active=None,
-        quarantine_release=None,
+        quarantine_release=None, condition_state=None,
     ):
         self.engine = engine
         self.expect_output = expect_output
@@ -1075,6 +1278,7 @@ class MacroController:
         self.is_active = is_active or self.engine.is_running
         self.profile_active = None
         self.quarantine_release = quarantine_release
+        self.condition_state = condition_state
         self.signals = MacroSignals()
         self.tasks = {}
         self.lock = threading.RLock()
@@ -1109,11 +1313,46 @@ class MacroController:
                 dict(preset), self.engine, self.signals,
                 self.expect_output, self.send_output, self.is_active,
                 self.profile_active, self.quarantine_release,
+                self.condition_state,
             )
             self.tasks[preset_id] = task
             task.start()
         self.signals.state_changed.emit()
         return True
+
+    def restart(self, preset, timeout=1.0):
+        """Safely replace one live task with a fresh run of the same preset."""
+        if not self.is_active():
+            return False
+        preset_id = str(preset.get("id") or "")
+        if not preset_id:
+            return False
+        with self.lock:
+            existing = self.tasks.get(preset_id)
+        if existing is None or not existing.has_live_threads():
+            return self.start(preset)
+
+        existing.stop()
+        # A condition branch can race with the retrigger edge. Block any new
+        # output first, then immediately release output it may already own.
+        released = bool(existing.force_release())
+        exited = bool(existing.wait_for_exit(timeout=max(0.05, float(timeout))))
+        if not released or not exited or existing.has_live_threads():
+            if not released:
+                with self.lock:
+                    self._remember_release_failure_locked(preset_id)
+            self.signals.state_changed.emit()
+            return False
+        if getattr(existing, "release_cleanup_failed", False):
+            with self.lock:
+                self._remember_release_failure_locked(preset_id)
+            self.signals.state_changed.emit()
+            return False
+
+        with self.lock:
+            if self.tasks.get(preset_id) is existing:
+                self.tasks.pop(preset_id, None)
+        return self.start(preset)
 
     def finish(self, preset_id):
         finished_task = None

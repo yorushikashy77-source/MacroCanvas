@@ -7,11 +7,16 @@ import os
 import queue as queue_module
 import threading
 import time
+import platform
+import sys
+from collections import Counter
+from pathlib import Path
 
 from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -27,7 +32,12 @@ from core.constants import (
     DIAGNOSTIC_LOG_PATH,
     DIAGNOSTIC_MAX_LINES,
     DIAGNOSTIC_TRIM_INTERVAL,
+    KANATA_KEYBOARD_LOG_PATH,
+    KANATA_LOG_PATH,
 )
+from macro.actions import iter_action_tree
+from ui.diagnostic_bundle import write_diagnostic_bundle
+from ui.operation_state import operation_blocks, operation_state_snapshot
 
 
 class RuntimeDiagnosticsMixin:
@@ -203,6 +213,90 @@ class RuntimeDiagnosticsMixin:
     def clear_diagnostic_log(self):
         self.reset_diagnostic_log()
 
+    def _diagnostic_configuration_summary(self):
+        mappings = self.collect_mappings()
+        presets = self.collect_presets()
+        action_types = Counter()
+        action_count = 0
+        for preset in presets:
+            for action in iter_action_tree(preset.get("actions", []) or []):
+                action_count += 1
+                action_types[str(action.get("type") or "动作")] += 1
+        return {
+            "mapping_count": len(mappings),
+            "enabled_mapping_count": sum(bool(item.get("enabled")) for item in mappings),
+            "preset_count": len(presets),
+            "enabled_preset_count": sum(bool(item.get("enabled")) for item in presets),
+            "action_count": action_count,
+            "action_type_counts": dict(sorted(action_types.items())),
+            "profile_count": len(getattr(self, "profiles", []) or []) + 1,
+            "diagnostic_enabled": bool(getattr(self, "runtime_diagnostic_enabled", False)),
+        }
+
+    @Slot()
+    def export_diagnostic_bundle(self):
+        blocked, snapshot = operation_blocks(self, "diagnostic_export")
+        if blocked:
+            QMessageBox.information(
+                self, "无法导出诊断包", f"{snapshot.label}，无法开始新的导出。"
+            )
+            return False
+        suggested = str(Path.home() / "Desktop" / "MacroCanvas-诊断包.zip")
+        destination, _filter = QFileDialog.getSaveFileName(
+            self, "导出脱敏诊断包", suggested, "ZIP 压缩包 (*.zip)"
+        )
+        if not destination:
+            return False
+        if not destination.casefold().endswith(".zip"):
+            destination += ".zip"
+        try:
+            self._flush_diagnostic_queue(timeout=0.5)
+            operation = operation_state_snapshot(self)
+            with self.macro_controller.lock:
+                active_tasks = len(self.macro_controller.tasks)
+            summary = {
+                "application": "MacroCanvas",
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "operation": operation.to_dict(),
+                "engine_running": bool(getattr(self, "running", False)),
+                "engine_state": str(getattr(
+                    getattr(self, "engine_state", None), "value", "unknown"
+                )),
+                "config_state": str(getattr(
+                    getattr(self, "config_state", None), "value", "unknown"
+                )),
+                "macro_state": str(getattr(
+                    getattr(self, "macro_state", None), "value", "unknown"
+                )),
+                "active_macro_count": active_tasks,
+                "dropped_diagnostic_lines": int(getattr(
+                    self, "diagnostic_dropped_count", 0
+                )),
+            }
+            included = write_diagnostic_bundle(
+                destination,
+                summary,
+                self._diagnostic_configuration_summary(),
+                (
+                    ("diagnostic.log", DIAGNOSTIC_LOG_PATH),
+                    ("kanata.log", KANATA_LOG_PATH),
+                    ("kanata-keyboard.log", KANATA_KEYBOARD_LOG_PATH),
+                ),
+                home=Path.home(),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            QMessageBox.warning(self, "导出失败", f"诊断包未能生成：\n{error}")
+            return False
+        QMessageBox.information(
+            self,
+            "导出完成",
+            f"脱敏诊断包已保存：\n{destination}\n\n"
+            f"包含 {len(included)} 份可用日志；原始配置未写入压缩包。",
+        )
+        return True
+
     def open_runtime_debugger(self):
         if self.runtime_debug_dialog is not None:
             self.runtime_debug_dialog.show()
@@ -376,4 +470,3 @@ class RuntimeDiagnosticsMixin:
                 self.diagnostic_queue.put_nowait(item)
             except (queue_module.Empty, queue_module.Full):
                 self.diagnostic_dropped_count += 1
-

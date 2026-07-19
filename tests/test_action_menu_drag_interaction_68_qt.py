@@ -10,7 +10,7 @@ try:
     from PySide6.QtCore import QPoint, QPointF, QSize, Qt
     from PySide6.QtGui import QWheelEvent
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+    from PySide6.QtWidgets import QApplication, QComboBox, QTreeWidgetItem
     from ui.editors import ActionTreeWidget
 except Exception as exc:  # pragma: no cover - optional GUI dependency
     QApplication = None
@@ -95,6 +95,25 @@ class ActionMenuDragInteraction68QtTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(tree.verticalScrollBar().value() - before, 1)
         self.assertEqual(tree._drag_scroll_timer.interval(), 500)
+
+    def test_clicking_embedded_combo_selects_only_its_owner_row(self):
+        tree = self.make_tree(count=6)
+        combos = []
+        for index in range(6):
+            combo = QComboBox()
+            combo.addItems(["选项 A", "选项 B"])
+            tree.setItemWidget(tree.topLevelItem(index), 1, combo)
+            combos.append(combo)
+        self.app.processEvents()
+
+        tree.selectAll()
+        self.assertEqual(len(tree.selectedItems()), 6)
+        QTest.mouseClick(combos[-1], Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+
+        self.assertEqual(tree.selectedItems(), [tree.topLevelItem(5)])
+        self.assertIs(tree.currentItem(), tree.topLevelItem(5))
+        QTest.keyClick(combos[-1], Qt.Key.Key_Escape)
 
 
 if __name__ == "__main__":

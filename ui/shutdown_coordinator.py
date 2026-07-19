@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QMessageBox
 
@@ -305,6 +303,14 @@ class ShutdownCoordinatorMixin:
             self.auto_apply_timer.stop()
         self.recording_session_active = False
         self.recording = False
+        self.recording_restore_pending = False
+        self.recording_workflow_complete = False
+        self.recording_restore_layer = None
+        self.recording_generation = int(
+            getattr(self, "recording_generation", 0)
+        ) + 1
+        self._macro_stop_gate_restore = None
+        self._deferred_profile_input_restore = None
 
         # Keep the live backend ownership flags intact until every macro worker
         # has completed its final Release calls.  Worker cleanup consults
@@ -422,6 +428,8 @@ class ShutdownCoordinatorMixin:
         complete = bool(keyboard_ok and main_ok and not critical_failed)
         self._shutdown_complete = complete
         if complete:
+            if hasattr(self, "dispose_system_tray"):
+                self.dispose_system_tray()
             self._shutdown_in_progress = False
             self.engine_state = EngineState.STOPPED
             self._finalize_shutdown_diagnostics(issues, complete=True)
@@ -462,7 +470,57 @@ class ShutdownCoordinatorMixin:
             except Exception:
                 pass
 
+    def _has_unapplied_changes_for_shutdown(self):
+        if self.config_state == ConfigState.DIRTY:
+            return True
+        if self.config_state != ConfigState.FAILED:
+            return False
+        try:
+            return self.current_config_signature() != self.applied_config_signature
+        except Exception:
+            return True
+
+    def _cancel_silent_tray_exit(self, event, reason):
+        self._tray_exit_requested = False
+        notice = getattr(self, "show_tray_exit_blocked_notice", None)
+        if callable(notice):
+            notice(reason)
+        event.ignore()
+
+    def _close_from_system_tray_silently(self, event):
+        """Exit without foregrounding the main window or opening destructive dialogs."""
+        if getattr(self, "recording_session_active", False):
+            self._cancel_silent_tray_exit(
+                event, "录制尚未结束，未自动退出以避免丢失本次录制。"
+            )
+            return
+        if self._has_unapplied_changes_for_shutdown():
+            self._cancel_silent_tray_exit(
+                event, "存在未应用的修改，未自动退出以避免丢失配置。"
+            )
+            return
+        if self._shutdown_quarantined_mouse_names():
+            self._cancel_silent_tray_exit(
+                event, "有鼠标按键正等待回到原窗口释放，未自动退出。"
+            )
+            return
+        if not self.shutdown():
+            self._cancel_silent_tray_exit(
+                event, "关键线程或输入资源尚未安全停止，程序仍在托盘中运行。"
+            )
+            return
+        event.accept()
+
     def closeEvent(self, event):
+        if (
+            hasattr(self, "should_hide_close_to_tray")
+            and self.should_hide_close_to_tray()
+        ):
+            self.hide_close_to_tray(event)
+            return
+        if getattr(self, "_tray_exit_requested", False):
+            self._close_from_system_tray_silently(event)
+            return
         if (
             getattr(self, "_shutdown_started", False)
             and not getattr(self, "_shutdown_complete", False)
@@ -526,15 +584,7 @@ class ShutdownCoordinatorMixin:
                 event.ignore()
                 return
 
-        has_unapplied_changes = self.config_state == ConfigState.DIRTY
-        if self.config_state == ConfigState.FAILED:
-            try:
-                has_unapplied_changes = (
-                    self.current_config_signature()
-                    != self.applied_config_signature
-                )
-            except Exception:
-                has_unapplied_changes = True
+        has_unapplied_changes = self._has_unapplied_changes_for_shutdown()
         if has_unapplied_changes:
             confirm = QMessageBox(self)
             confirm.setIcon(QMessageBox.Icon.Warning)

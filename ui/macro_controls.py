@@ -4,6 +4,7 @@ import inspect
 import time
 
 from PySide6.QtCore import QTimer, Slot
+from PySide6.QtWidgets import QMessageBox, QSystemTrayIcon
 
 from core.constants import MacroState
 from ui.runtime_guards import (
@@ -14,6 +15,15 @@ from ui.runtime_guards import (
 
 class MacroControlsMixin:
     MACRO_STOP_TIMEOUT_SECONDS = 2.0
+
+    def _macro_callback_blocked_by_shutdown(self):
+        """Keep delayed task callbacks from reopening output during shutdown."""
+        if not getattr(self, "_shutdown_started", False):
+            return False
+        self.output_shutdown_in_progress = True
+        self._macro_stop_gate_restore = None
+        self._deferred_profile_input_restore = None
+        return True
 
     def _mark_macro_stop_started(self):
         self._macro_stop_started_at = time.perf_counter()
@@ -96,6 +106,85 @@ class MacroControlsMixin:
 
     def _runtime_cleanup_blocks_new_output(self):
         return runtime_cleanup_blocks_new_output(self)
+
+    @staticmethod
+    def _format_virtual_screen_geometry(value):
+        try:
+            left, top, width, height = (int(item) for item in value)
+        except (TypeError, ValueError, OverflowError):
+            return "无法读取"
+        return f"左上角 ({left}, {top})，{width} × {height}"
+
+    def _recorded_mouse_context_message(self, issue):
+        issue = issue or {}
+        preset_name = str(issue.get("preset_name") or "该宏")
+        kind = str(issue.get("kind") or "screen")
+        if kind == "monitor_count":
+            expected = issue.get("expected")
+            current = issue.get("current")
+            return (
+                f"“{preset_name}”包含按显示器数量录制的鼠标坐标。\n\n"
+                f"录制时：{expected} 台显示器\n"
+                f"当前：{current if current is not None else '无法读取'} 台显示器\n\n"
+                "为避免鼠标落到错误位置，本次没有开始执行。请恢复录制时的"
+                "显示器布局，或在当前布局下重新录制该宏。"
+            )
+        expected = self._format_virtual_screen_geometry(issue.get("expected"))
+        current = self._format_virtual_screen_geometry(issue.get("current"))
+        return (
+            f"“{preset_name}”包含按绝对屏幕坐标录制的鼠标移动。\n\n"
+            f"录制时的屏幕布局：{expected}\n"
+            f"当前屏幕布局：{current}\n\n"
+            "为避免鼠标落到错误位置，本次没有开始执行。请恢复录制时的"
+            "显示布局，或在当前布局下重新录制该宏。"
+        )
+
+    def _show_recorded_mouse_context_issue(self, preset, issue, modal=True):
+        payload = dict(issue or {})
+        payload.setdefault("preset_name", str((preset or {}).get("name") or "宏任务"))
+        message = self._recorded_mouse_context_message(payload)
+        if hasattr(self, "write_diagnostic"):
+            self.write_diagnostic(
+                "recorded_mouse_context_start_blocked",
+                force=True,
+                preset_id=str((preset or {}).get("id") or ""),
+                preset_name=payload["preset_name"],
+                source=payload.get("source") or "menu",
+                issue=payload,
+            )
+        if hasattr(self, "engine_hint"):
+            self.engine_hint.setStyleSheet("color: #fbbf24;")
+            self.engine_hint.setText("宏未执行：录制时的屏幕布局与当前不一致")
+        if hasattr(self, "execution_info"):
+            self.execution_info.setText(
+                "已阻止执行：请恢复录制时的显示布局，或重新录制该宏"
+            )
+        if hasattr(self, "activity_overlay") and not getattr(
+            self, "recording_session_active", False
+        ):
+            self.activity_overlay.show_message(
+                "宏未执行 · 屏幕布局不一致", "请查看提示并重新录制或恢复显示布局", "#fbbf24"
+            )
+        if modal:
+            QMessageBox.warning(self, "屏幕布局不一致，未开始执行", message)
+        return message
+
+    @Slot(dict)
+    def on_recorded_mouse_context_mismatch(self, issue):
+        """Show hotkey rejection feedback without moving focus away from its target."""
+        if self._macro_callback_blocked_by_shutdown():
+            return
+        message = self._show_recorded_mouse_context_issue(issue, issue, modal=False)
+        tray = getattr(self, "system_tray", None)
+        if tray is not None and tray.isVisible():
+            tray.showMessage(
+                "MacroCanvas：宏未执行",
+                message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                7000,
+            )
+        self.refresh_status_ui()
+        self.refresh_macro_controls()
 
     def _explain_runtime_cleanup_block(self, context="runtime_trigger"):
         return explain_runtime_cleanup_block(self, context)
@@ -290,6 +379,8 @@ class MacroControlsMixin:
     @Slot(str)
     def on_macro_finished(self, preset_id):
         finished_task = self.macro_controller.finish(preset_id)
+        if self._macro_callback_blocked_by_shutdown():
+            return
         remaining_task = self.macro_controller.tasks.get(preset_id)
         if remaining_task is not None and remaining_task.has_live_threads():
             self.active_macro_id = preset_id
@@ -687,6 +778,8 @@ class MacroControlsMixin:
         )
 
     def _poll_stopping_macros(self):
+        if self._macro_callback_blocked_by_shutdown():
+            return
         stale_cleanup_failures = []
         with self.macro_controller.lock:
             remaining = [

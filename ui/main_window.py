@@ -107,6 +107,8 @@ from ui.editor_workflow import EditorWorkflowMixin
 from ui.runtime_diagnostics import RuntimeDiagnosticsMixin
 from ui.trigger_conflicts import TriggerConflictMixin
 from ui.widget_behaviors import WheelEditBlocker
+from ui.catalog_tools import CatalogToolsMixin
+from ui.system_tray import SystemTrayMixin
 
 
 class MainWindow(
@@ -120,11 +122,13 @@ class MainWindow(
     LoadingCoordinatorMixin,
     RuntimeLifecycleMixin,
     ShutdownCoordinatorMixin,
+    SystemTrayMixin,
     MacroControlsMixin,
     ProfileWorkflowMixin,
     InputListenerLifecycleMixin,
     InputRuntimeMixin,
     RecordingWorkflowMixin,
+    CatalogToolsMixin,
     MappingEditorMixin,
     PresetEditorMixin,
     EditorWorkflowMixin,
@@ -139,12 +143,14 @@ class MainWindow(
     global_toggle_signal = Signal(bool)
     macro_pause_signal = Signal()
     feedback_signal = Signal(str)
+    recorded_mouse_context_mismatch_signal = Signal(dict)
     kanata_trigger_signal = Signal(str, str, str, str)
     kanata_state_signal = Signal(str, bool)
     kanata_control_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
+        self._initialize_system_tray_state()
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 800)
         self.setMinimumSize(760, 500)
@@ -289,6 +295,9 @@ class MainWindow(
         # IDs and WinInput supplies left/right modifier IDs. The public config
         # model still uses the existing logical names.
         self.physical_input_sources = {}
+        self.macro_controller.condition_state = (
+            self._macro_action_condition_satisfied
+        )
         self.held_trigger_ids = {}
         self.kanata_trigger_down = set()
         # 同步映射由 Kanata 虚拟键 Press/Release 保持。相同输出使用引用
@@ -426,6 +435,7 @@ class MainWindow(
         self.applied_config_signature = ""
         self.applied_config_payload = None
         self.build_ui()
+        self.setup_system_tray()
         self._initialize_feedback_audio()
         self.activity_overlay = ActivityOverlay()
         self.global_input_signal.connect(self.handle_global_input)
@@ -441,6 +451,10 @@ class MainWindow(
         )
         self.global_toggle_signal.connect(self.handle_global_toggle_fallback)
         self.macro_pause_signal.connect(self.toggle_all_macro_pause)
+        self.recorded_mouse_context_mismatch_signal.connect(
+            self.on_recorded_mouse_context_mismatch,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self.kanata_trigger_signal.connect(self.handle_kanata_trigger)
         self.kanata_state_signal.connect(self.handle_kanata_state)
         self.kanata_control_signal.connect(self.handle_kanata_control)
@@ -490,6 +504,8 @@ class MainWindow(
         self.backend_health_timer.timeout.connect(self.check_input_backend_health)
         self.backend_health_timer.start()
         self.initializing = False
+        self.refresh_mapping_filters()
+        self.refresh_preset_filters()
         self.refresh_status_ui()
         # 启动阶段不能固定安装 Windows 全局钩子。游戏模式且引擎处于
         # 关闭状态时，必须立即建立 control-only Interception context，
@@ -499,6 +515,11 @@ class MainWindow(
 
     def initialize_startup_input_listener(self):
         """按当前后端初始化启动监听，并为 Interception 提供有限重试。"""
+        if (
+            getattr(self, "_shutdown_started", False)
+            or getattr(self, "output_backend_retired", False)
+        ):
+            return False
         ok = self.update_global_hook_for_backend()
         if ok:
             self.write_diagnostic(
@@ -560,6 +581,7 @@ class MainWindow(
         self.global_hotkey_action.triggered.connect(
             self.open_global_hotkey_settings
         )
+        self.add_system_tray_settings(settings_menu)
         self.kanata_directory_action = settings_menu.addAction(
             "设置 Kanata 组件目录…"
         )
@@ -607,6 +629,12 @@ class MainWindow(
         )
         self.open_diagnostic_action.triggered.connect(
             self.open_diagnostic_log
+        )
+        self.export_diagnostic_bundle_action = settings_menu.addAction(
+            "导出脱敏诊断包…"
+        )
+        self.export_diagnostic_bundle_action.triggered.connect(
+            self.export_diagnostic_bundle
         )
         self.runtime_debug_action = settings_menu.addAction("运行调试器")
         self.runtime_debug_action.triggered.connect(self.open_runtime_debugger)
@@ -727,17 +755,10 @@ class MainWindow(
         outer.setContentsMargins(32, 26, 32, 22)
         outer.setSpacing(16)
 
+        # 顶部左侧直接显示运行状态；不再保留仅作装饰的品牌区。
         top = QHBoxLayout()
-        brand = QVBoxLayout()
-        title = QLabel("MacroCanvas")
-        title.setObjectName("title")
-        subtitle = QLabel("键鼠映射与动作序列")
-        subtitle.setObjectName("muted")
-        brand.addWidget(title)
-        brand.addWidget(subtitle)
-        top.addLayout(brand)
-        top.addStretch()
         status_box = QHBoxLayout()
+        status_box.setSpacing(10)
         self.runtime_profile_status = QLabel()
         self.engine_status = QLabel()
         self.config_status = QLabel()
@@ -751,28 +772,18 @@ class MainWindow(
             label.setObjectName("statusOff")
             status_box.addWidget(label)
         top.addLayout(status_box)
-        outer.addLayout(top)
+        top.addStretch()
 
-        engine = QFrame()
-        engine.setObjectName("card")
-        row = QHBoxLayout(engine)
-        row.setContentsMargins(20, 15, 20, 15)
-        info = QVBoxLayout()
-        heading = QLabel("映射引擎")
-        heading.setObjectName("heading")
-        self.engine_hint = QLabel("Kanata 引擎尚未启动")
-        self.engine_hint.setObjectName("muted")
-        info.addWidget(heading)
-        info.addWidget(self.engine_hint)
-        row.addLayout(info)
-        row.addStretch()
+        # 引擎控制移至原状态区的右侧，作为一组保持在同一行。
+        engine_controls = QHBoxLayout()
+        engine_controls.setSpacing(10)
         self.backend_combo = QComboBox()
         self.backend_combo.addItems(KanataEngine.EXECUTABLES.keys())
         self.backend_combo.setToolTip(
             "普通模式无需驱动；游戏模式需要已安装 Interception 驱动"
         )
         self.backend_combo.currentTextChanged.connect(self.data_changed)
-        row.addWidget(self.backend_combo)
+        engine_controls.addWidget(self.backend_combo)
 
         self.force_release_button = QPushButton("强制释放键鼠")
         self.force_release_button.setObjectName("dangerGhost")
@@ -780,11 +791,26 @@ class MainWindow(
             "停止当前宏任务并释放本程序持有的键盘和鼠标状态；输入引擎保持运行"
         )
         self.force_release_button.clicked.connect(self.force_release_held_inputs)
-        row.addWidget(self.force_release_button)
+        engine_controls.addWidget(self.force_release_button)
         self.toggle_button = QPushButton("启动 Kanata")
         self.toggle_button.setObjectName("primary")
         self.toggle_button.clicked.connect(self.toggle_running)
-        row.addWidget(self.toggle_button)
+        engine_controls.addWidget(self.toggle_button)
+        top.addLayout(engine_controls)
+        outer.addLayout(top)
+
+        engine = QFrame()
+        engine.setObjectName("card")
+        row = QHBoxLayout(engine)
+        row.setContentsMargins(20, 15, 20, 15)
+        row.setSpacing(8)
+        heading = QLabel("映射引擎：")
+        heading.setObjectName("heading")
+        self.engine_hint = QLabel("Kanata 引擎尚未启动")
+        self.engine_hint.setObjectName("muted")
+        self.engine_hint.setWordWrap(False)
+        row.addWidget(heading)
+        row.addWidget(self.engine_hint, 1)
         outer.addWidget(engine)
 
         self.tabs = QTabWidget()
@@ -818,9 +844,8 @@ class MainWindow(
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(8)
 
-        # 配置档案属于映射管理操作，与“自动应用 / 应用更改”放在
-        # 同一标题栏内。该控件会随当前标签页一起移动，不再占用
-        # 顶部映射引擎控制区域。
+        # 档案选择和“自动应用 / 应用更改”分别放入页头的两个位置，
+        # 让筛选与批量操作可以位于两者之间。
         self.profile_selector_frame = QFrame()
         self.profile_selector_frame.setObjectName("parameterArea")
         profile_selector_layout = QHBoxLayout(self.profile_selector_frame)
@@ -854,7 +879,6 @@ class MainWindow(
             self.on_main_profile_view_clicked
         )
         profile_selector_layout.addWidget(self.profile_selector_combo)
-        controls.addWidget(self.profile_selector_frame)
 
         self.auto_apply_checkbox = QCheckBox("自动应用")
         self.auto_apply_checkbox.setChecked(False)
@@ -876,22 +900,30 @@ class MainWindow(
 
     @Slot(int)
     def move_apply_controls_to_tab(self, index):
-        widget = getattr(self, "apply_controls_widget", None)
-        if widget is None:
-            return
-        target_host = (
-            self.mapping_apply_host
-            if index == 0 else self.preset_apply_host
+        targets = (
+            (
+                self.profile_selector_frame,
+                self.mapping_profile_host if index == 0 else self.preset_profile_host,
+                "_profile_selector_host",
+            ),
+            (
+                self.apply_controls_widget,
+                self.mapping_apply_host if index == 0 else self.preset_apply_host,
+                "_apply_controls_host",
+            ),
         )
-        current_host = getattr(self, "_apply_controls_host", None)
-        if current_host is target_host:
-            return
-        if current_host is not None and current_host.layout() is not None:
-            current_host.layout().removeWidget(widget)
-        widget.setParent(target_host)
-        target_host.layout().addWidget(widget)
-        widget.show()
-        self._apply_controls_host = target_host
+        for widget, target_host, host_attribute in targets:
+            if widget is None:
+                continue
+            current_host = getattr(self, host_attribute, None)
+            if current_host is target_host:
+                continue
+            if current_host is not None and current_host.layout() is not None:
+                current_host.layout().removeWidget(widget)
+            widget.setParent(target_host)
+            target_host.layout().addWidget(widget)
+            widget.show()
+            setattr(self, host_attribute, target_host)
 
     @staticmethod
     def build_apply_controls_host():
@@ -905,19 +937,36 @@ class MainWindow(
     def build_mapping_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
 
+        # 映射页的档案管理与筛选操作共用一行，避免重复的标题说明区
+        # 挤占映射卡片的可视空间。
         header = QHBoxLayout()
-        copy = QVBoxLayout()
-        self.mapping_section_title = QLabel("基础映射")
-        self.mapping_section_title.setObjectName("heading")
-        hint = QLabel("每条映射仅显示常用内容；展开“参数”后，只显示当前执行模式需要的设置。")
-        hint.setObjectName("muted")
-        copy.addWidget(self.mapping_section_title)
-        copy.addWidget(hint)
-        header.addLayout(copy)
-        header.addStretch()
+        header.setSpacing(8)
+        self.mapping_profile_host = self.build_apply_controls_host()
+        header.addWidget(self.mapping_profile_host)
+        self.mapping_search = QLineEdit()
+        self.mapping_search.setPlaceholderText("搜索名称、来源、目标或执行模式…")
+        self.mapping_search.setClearButtonEnabled(True)
+        self.mapping_search.textChanged.connect(self.refresh_mapping_filters)
+        self.mapping_search.setMinimumWidth(220)
+        header.addWidget(self.mapping_search, 1)
+        self.mapping_enabled_filter = QComboBox()
+        self.mapping_enabled_filter.addItems(["全部状态", "已启用", "已停用"])
+        self.mapping_enabled_filter.currentTextChanged.connect(
+            self.refresh_mapping_filters
+        )
+        header.addWidget(self.mapping_enabled_filter)
+        self.mapping_filter_result = QLabel("显示 0 / 0")
+        self.mapping_filter_result.setObjectName("muted")
+        header.addWidget(self.mapping_filter_result)
+        enable_filtered = QPushButton("启用筛选项")
+        enable_filtered.clicked.connect(self.enable_filtered_mappings)
+        header.addWidget(enable_filtered)
+        disable_filtered = QPushButton("停用筛选项")
+        disable_filtered.clicked.connect(self.disable_filtered_mappings)
+        header.addWidget(disable_filtered)
         self.mapping_apply_host = self.build_apply_controls_host()
         header.addWidget(self.mapping_apply_host)
         add = QPushButton("＋ 添加映射")
@@ -936,7 +985,7 @@ class MainWindow(
         self.mapping_container.setObjectName("mappingContainer")
         self.mapping_layout = QVBoxLayout(self.mapping_container)
         self.mapping_layout.setContentsMargins(2, 2, 8, 2)
-        self.mapping_layout.setSpacing(10)
+        self.mapping_layout.setSpacing(7)
         self.mapping_layout.addStretch(1)
         self.mapping_scroll.setWidget(self.mapping_container)
         layout.addWidget(self.mapping_scroll, 1)
@@ -945,19 +994,35 @@ class MainWindow(
     def build_preset_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
 
+        # 与基础映射页保持一致：档案管理与筛选操作共用一行。
         header = QHBoxLayout()
-        copy = QVBoxLayout()
-        self.preset_section_title = QLabel("预设方案")
-        self.preset_section_title.setObjectName("heading")
-        hint = QLabel("方案参数仍在卡片内展开；动作序列在独立窗口中编辑，避免占用主界面空间。")
-        hint.setObjectName("muted")
-        copy.addWidget(self.preset_section_title)
-        copy.addWidget(hint)
-        header.addLayout(copy)
-        header.addStretch()
+        header.setSpacing(8)
+        self.preset_profile_host = self.build_apply_controls_host()
+        header.addWidget(self.preset_profile_host)
+        self.preset_search = QLineEdit()
+        self.preset_search.setPlaceholderText("搜索名称、触发键或执行模式…")
+        self.preset_search.setClearButtonEnabled(True)
+        self.preset_search.textChanged.connect(self.refresh_preset_filters)
+        self.preset_search.setMinimumWidth(220)
+        header.addWidget(self.preset_search, 1)
+        self.preset_enabled_filter = QComboBox()
+        self.preset_enabled_filter.addItems(["全部状态", "已启用", "已停用"])
+        self.preset_enabled_filter.currentTextChanged.connect(
+            self.refresh_preset_filters
+        )
+        header.addWidget(self.preset_enabled_filter)
+        self.preset_filter_result = QLabel("显示 0 / 0")
+        self.preset_filter_result.setObjectName("muted")
+        header.addWidget(self.preset_filter_result)
+        enable_filtered = QPushButton("启用筛选项")
+        enable_filtered.clicked.connect(self.enable_filtered_presets)
+        header.addWidget(enable_filtered)
+        disable_filtered = QPushButton("停用筛选项")
+        disable_filtered.clicked.connect(self.disable_filtered_presets)
+        header.addWidget(disable_filtered)
         self.preset_apply_host = self.build_apply_controls_host()
         header.addWidget(self.preset_apply_host)
         add = QPushButton("＋ 添加预设")
@@ -974,7 +1039,7 @@ class MainWindow(
         self.preset_container.setObjectName("presetContainer")
         self.preset_layout = QVBoxLayout(self.preset_container)
         self.preset_layout.setContentsMargins(2, 2, 8, 2)
-        self.preset_layout.setSpacing(14)
+        self.preset_layout.setSpacing(7)
         self.preset_layout.addStretch(1)
         self.preset_scroll.setWidget(self.preset_container)
         layout.addWidget(self.preset_scroll, 1)
@@ -1740,7 +1805,9 @@ class MainWindow(
                     }
                     current_index = action_index
                     action_index += 1
-                    if copied_action.get("type") not in ("等待", LOOP_ACTION_TYPE):
+                    if copied_action.get("type") not in (
+                        "等待", LOOP_ACTION_TYPE, *CONTROL_ACTION_TYPES,
+                    ):
                         copied_action["_vkey"] = (
                             KanataConfigBuilder.preset_action_key(
                                 copied_preset.get("id"), current_index, namespace
@@ -1756,6 +1823,13 @@ class MainWindow(
                 preset.get("actions", [])
             )
             cached_presets.append(copied_preset)
+
+        preset_library = {
+            str(preset.get("id")): preset
+            for preset in cached_presets if preset.get("id")
+        }
+        for preset in cached_presets:
+            preset["_preset_library"] = preset_library
 
         return {
             "id": str(profile_id or ""),
@@ -1793,8 +1867,13 @@ class MainWindow(
             ),
             "speed_percent": int(copied.get("speed_percent", 100)),
             "max_runtime_s": int(copied.get("max_runtime_s", 0)),
+            "condition_enabled": bool(copied.get("condition_enabled", False)),
+            "condition_input": copied.get("condition_input", "鼠标左键"),
+            "condition_state": copied.get("condition_state", "按住时"),
             "name": copied.get("name", "预设"),
+            "parameters": copy.deepcopy(copied.get("parameters", [])),
             "actions": clone_action_tree(copied.get("actions", [])),
+            "_preset_library": copied.get("_preset_library", {}),
             "_runtime_kind": "preset",
         }
 
@@ -2210,7 +2289,9 @@ class MainWindow(
             valid_ids = {
                 str(action.get("action_id"))
                 for action in iter_action_tree(ordinary)
-                if action.get("type") != LOOP_ACTION_TYPE and action.get("action_id")
+                if action.get("type") not in (
+                    LOOP_ACTION_TYPE, *CONDITION_BRANCH_TYPES,
+                ) and action.get("action_id")
             }
             for loop in deferred_loops:
                 loop["target_action_ids"] = [
@@ -2247,6 +2328,9 @@ class MainWindow(
                 preset["actions"] = migrate_actions(
                     preset.get("actions", [])
                 )
+                preset.setdefault("condition_enabled", False)
+                preset.setdefault("condition_input", "鼠标左键")
+                preset.setdefault("condition_state", "按住时")
                 preset.setdefault("loop_interval_jitter_ms", 0)
                 presets.append(preset)
             return {"mappings": mappings, "presets": presets}

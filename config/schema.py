@@ -20,6 +20,8 @@ MAX_CONFIG_FILE_BYTES = 25 * 1024 * 1024
 # list. Keep ample room above MAX_ACTION_DEPTH while staying well below the
 # interpreter recursion limit used by deepcopy and the legacy repair walkers.
 MAX_CONFIG_STRUCTURE_DEPTH = 256
+MAX_PRESET_PARAMETERS = 32
+PARAMETER_TYPES = {"按键", "整数", "时长"}
 
 MOUSE_NAMES = {
     "鼠标左键", "鼠标右键", "鼠标中键", "鼠标侧键 1", "鼠标侧键 2",
@@ -35,14 +37,19 @@ KEY_NAMES = {
     *(f"F{index}" for index in range(1, 25)),
 }
 INPUT_NAMES = MOUSE_NAMES | KEY_NAMES
-SOURCE_NAMES = INPUT_NAMES - {"Esc"}
+SOURCE_NAMES = set(INPUT_NAMES)
+CONDITION_INPUT_NAMES = set(INPUT_NAMES)
+SYSTEM_HOTKEY_NAMES = INPUT_NAMES - {"Esc"}
 MODIFIER_OPTIONS = {
     "无", "Ctrl", "Shift", "Alt", "Ctrl+Shift", "Ctrl+Alt", "Shift+Alt",
     "Ctrl+Shift+Alt",
 }
 ACTION_TYPES = {
     "键盘点击", "鼠标点击", "鼠标滚轮", "鼠标移动", "等待", "循环动作",
+    "调用子宏", "条件分支", "等待条件",
+    "条件成立分支", "否则分支",
 }
+CONDITION_BRANCH_TYPES = {"条件成立分支", "否则分支"}
 MAPPING_MODES = {
     "同步按住", "执行一次", "固定次数", "按住循环", "开关循环", "无限循环",
     "单次触发",  # 旧配置名称，载入时会迁移为“执行一次”。
@@ -390,7 +397,8 @@ def _validate_mapping(mapping, index, seen_ids):
     _validate_hotkey(mapping, "target_modifiers", "target", path, INPUT_NAMES)
     if "condition_input" in mapping:
         _validate_choice(
-            mapping["condition_input"], path + ("condition_input",), SOURCE_NAMES
+            mapping["condition_input"], path + ("condition_input",),
+            CONDITION_INPUT_NAMES,
         )
     if mapping.get("condition_enabled"):
         if "condition_input" not in mapping:
@@ -399,20 +407,72 @@ def _validate_mapping(mapping, index, seen_ids):
             raise ValueError(f"{_path_text(path + ('condition_state',))} 不能为空")
 
 
-def _validate_action(action, path, state, depth, require_runtime_fields=False):
+def _validate_action(
+    action, path, state, depth, require_runtime_fields=False,
+    parent_type=None,
+):
     if depth > MAX_ACTION_DEPTH:
         raise ValueError(f"{_path_text(path)} 超过最大嵌套层级 {MAX_ACTION_DEPTH}")
     _require_dict(action, path)
-    state["count"] += 1
-    if state["count"] > MAX_ACTION_COUNT:
-        raise ValueError(f"{_path_text(path)} 的动作总数超过 {MAX_ACTION_COUNT}")
-
     if require_runtime_fields:
         _require_non_empty_field(action, "type", path)
     action_type = action.get("type", "键盘点击")
     _validate_choice(action_type, path + ("type",), ACTION_TYPES)
+    if action_type not in CONDITION_BRANCH_TYPES:
+        state["count"] += 1
+        if state["count"] > MAX_ACTION_COUNT:
+            raise ValueError(
+                f"{_path_text(path)} 的动作总数超过 {MAX_ACTION_COUNT}"
+            )
     children = action.get("children", [])
     _require_list(children, path + ("children",))
+    if "parameter_bindings" in action:
+        bindings = _require_dict(
+            action["parameter_bindings"], path + ("parameter_bindings",)
+        )
+        for field, parameter_name in bindings.items():
+            _validate_string(
+                field, path + ("parameter_bindings", "字段"),
+                allow_empty=False, maximum=64,
+            )
+            _validate_string(
+                parameter_name,
+                path + ("parameter_bindings", field),
+                allow_empty=False, maximum=32,
+            )
+    if "parameter_values" in action:
+        values = _require_dict(
+            action["parameter_values"], path + ("parameter_values",)
+        )
+        for parameter_name in values:
+            _validate_string(
+                parameter_name, path + ("parameter_values", "名称"),
+                allow_empty=False, maximum=32,
+            )
+
+    if action_type in CONDITION_BRANCH_TYPES and parent_type != "条件分支":
+        raise ValueError(
+            f"{_path_text(path)} 只能作为条件分支的直接子项"
+        )
+    if action_type == "条件分支":
+        branch_children = [
+            child for child in children
+            if isinstance(child, dict)
+            and child.get("type") in CONDITION_BRANCH_TYPES
+        ]
+        if branch_children:
+            if len(branch_children) != len(children):
+                raise ValueError(
+                    f"{_path_text(path + ('children',))} 不能混合分支容器和普通动作"
+                )
+            branch_types = [child.get("type") for child in branch_children]
+            if (
+                branch_types.count("条件成立分支") != 1
+                or branch_types.count("否则分支") != 1
+            ):
+                raise ValueError(
+                    f"{_path_text(path + ('children',))} 必须各包含一个条件成立分支和否则分支"
+                )
 
     if action_type == "循环动作":
         loop_id = action.get("id")
@@ -495,11 +555,68 @@ def _validate_action(action, path, state, depth, require_runtime_fields=False):
                 _validate_int(action["wait_ms"], path + ("wait_ms",), 1, 600_000)
             if "jitter_ms" in action:
                 _validate_int(action["jitter_ms"], path + ("jitter_ms",), 0, 600_000)
+        elif action_type == "条件分支":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "condition_input", path)
+                _require_non_empty_field(action, "condition_state", path)
+            if "condition_input" in action:
+                _validate_choice(
+                    action["condition_input"], path + ("condition_input",),
+                    CONDITION_INPUT_NAMES,
+                )
+            if "condition_state" in action:
+                _validate_choice(
+                    action["condition_state"], path + ("condition_state",),
+                    MAPPING_CONDITION_STATES,
+                )
+        elif action_type == "等待条件":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "condition_input", path)
+                _require_non_empty_field(action, "condition_state", path)
+            if "condition_input" in action:
+                _validate_choice(
+                    action["condition_input"], path + ("condition_input",),
+                    CONDITION_INPUT_NAMES,
+                )
+            if "condition_state" in action:
+                _validate_choice(
+                    action["condition_state"], path + ("condition_state",),
+                    MAPPING_CONDITION_STATES,
+                )
+            _validate_optional_fields(action, {
+                "timeout_ms": lambda value: _validate_int(
+                    value, path + ("timeout_ms",), 0, 600_000
+                ),
+                "poll_ms": lambda value: _validate_int(
+                    value, path + ("poll_ms",), 10, 1_000
+                ),
+            })
+        elif action_type == "调用子宏":
+            if require_runtime_fields:
+                _require_non_empty_field(action, "preset_id", path)
+            if "preset_id" in action:
+                _validate_string(
+                    action["preset_id"], path + ("preset_id",),
+                    allow_empty=not require_runtime_fields,
+                )
+            _validate_optional_fields(action, {
+                "repeat_count": lambda value: _validate_int(
+                    value, path + ("repeat_count",), 1, 100_000
+                ),
+                "speed_percent": lambda value: _validate_int(
+                    value, path + ("speed_percent",), 10, 500
+                ),
+            })
+        elif action_type in CONDITION_BRANCH_TYPES:
+            pass
 
     for child_index, child in enumerate(children, 1):
+        child_type = child.get("type") if isinstance(child, dict) else None
         _validate_action(
-            child, path + (f"子动作 {child_index}",), state, depth + 1,
+            child, path + (f"子动作 {child_index}",), state,
+            depth if child_type in CONDITION_BRANCH_TYPES else depth + 1,
             require_runtime_fields=require_runtime_fields,
+            parent_type=action_type,
         )
 
 
@@ -588,7 +705,7 @@ def _validate_loop_references(actions, path):
             action_path = level_path + (f"动作 {action_index}",)
             if action.get("type") == "循环动作":
                 loop_controls.append((action, action_path, depth))
-            else:
+            elif action.get("type") not in CONDITION_BRANCH_TYPES:
                 action_id = str(action.get("action_id") or "")
                 if action_id:
                     ordinary_ids.append(action_id)
@@ -664,9 +781,259 @@ def _validate_scope_sizes(mappings, presets, path, totals):
         raise ValueError(f"全部预设总数超过 {MAX_TOTAL_PRESETS}")
 
 
+def _validate_submacro_references(presets, path):
+    """Require same-scope targets and reject direct or indirect call cycles."""
+    preset_ids = {
+        str(preset.get("id")): preset
+        for preset in presets
+        if isinstance(preset, dict) and preset.get("id") not in (None, "")
+    }
+    graph = {preset_id: set() for preset_id in preset_ids}
+    for preset_id, preset in preset_ids.items():
+        stack = list(preset.get("actions", []) or [])
+        while stack:
+            action = stack.pop()
+            if not isinstance(action, dict):
+                continue
+            stack.extend(action.get("children", []) or [])
+            if action.get("type") != "调用子宏":
+                continue
+            target_id = str(action.get("preset_id") or "")
+            if not target_id:
+                continue
+            if target_id not in preset_ids:
+                raise ValueError(
+                    f"{_path_text(path)} 中的子宏调用指向了不存在的预设："
+                    f"{target_id}"
+                )
+            graph[preset_id].add(target_id)
+
+    visiting = set()
+    visited = set()
+
+    def visit(preset_id, chain):
+        if preset_id in visiting:
+            start = chain.index(preset_id) if preset_id in chain else 0
+            cycle = chain[start:] + [preset_id]
+            raise ValueError(
+                f"{_path_text(path)} 中的子宏调用形成循环："
+                + " -> ".join(cycle)
+            )
+        if preset_id in visited:
+            return
+        visiting.add(preset_id)
+        for target_id in graph.get(preset_id, ()):
+            visit(target_id, chain + [preset_id])
+        visiting.remove(preset_id)
+        visited.add(preset_id)
+
+    for preset_id in graph:
+        visit(preset_id, [])
+
+
+def _validate_parameter_default(definition, path):
+    kind = definition["type"]
+    value = definition.get("default")
+    if kind == "按键":
+        return _validate_choice(value, path + ("default",), INPUT_NAMES)
+    if kind == "整数":
+        return _validate_int(value, path + ("default",), 1, 100_000)
+    return _validate_int(value, path + ("default",), 0, 600_000)
+
+
+def _validate_preset_parameters(preset, path):
+    definitions = _require_list(
+        preset.get("parameters", []), path + ("parameters",)
+    )
+    if len(definitions) > MAX_PRESET_PARAMETERS:
+        raise ValueError(
+            f"{_path_text(path + ('parameters',))} 数量超过 "
+            f"{MAX_PRESET_PARAMETERS}"
+        )
+    by_name = {}
+    for index, definition in enumerate(definitions, 1):
+        definition_path = path + (f"变量 {index}",)
+        _require_dict(definition, definition_path)
+        raw_name = _validate_string(
+            definition.get("name"), definition_path + ("name",),
+            allow_empty=False, maximum=32,
+        )
+        name = raw_name.strip()
+        if raw_name != name:
+            raise ValueError(
+                f"{_path_text(definition_path + ('name',))} 首尾不能包含空格"
+            )
+        if name in by_name:
+            raise ValueError(
+                f"{_path_text(definition_path + ('name',))} 与其他变量重复"
+            )
+        kind = _validate_choice(
+            definition.get("type"), definition_path + ("type",),
+            PARAMETER_TYPES,
+        )
+        if "default" not in definition:
+            raise ValueError(
+                f"{_path_text(definition_path + ('default',))} 不能为空"
+            )
+        normalized = {"name": name, "type": kind, "default": definition["default"]}
+        _validate_parameter_default(normalized, definition_path)
+        by_name[name] = normalized
+    return by_name
+
+
+def _parameter_action_fields():
+    return {
+        "键盘点击": {
+            "target": ("按键", None, None, KEY_NAMES),
+            "hold_ms": ("时长", 1, 600_000, None),
+        },
+        "鼠标点击": {
+            "target": ("按键", None, None, MOUSE_NAMES),
+            "hold_ms": ("时长", 1, 600_000, None),
+        },
+        "鼠标滚轮": {"steps": ("整数", 1, 100, None)},
+        "等待": {"wait_ms": ("时长", 1, 600_000, None)},
+        "条件分支": {
+            "condition_input": ("按键", None, None, CONDITION_INPUT_NAMES)
+        },
+        "等待条件": {
+            "condition_input": ("按键", None, None, CONDITION_INPUT_NAMES),
+            "timeout_ms": ("时长", 0, 600_000, None),
+        },
+        "调用子宏": {
+            "repeat_count": ("整数", 1, 100_000, None),
+            "speed_percent": ("整数", 10, 500, None),
+        },
+        "循环动作": {
+            "loop_count": ("整数", 1, 100_000, None),
+            "loop_interval_ms": ("时长", 0, 600_000, None),
+            "speed_percent": ("整数", 10, 500, None),
+        },
+    }
+
+
+def _validate_parameter_references(presets, path):
+    preset_by_id = {
+        str(preset.get("id") or ""): preset
+        for preset in presets if isinstance(preset, dict) and preset.get("id")
+    }
+    definitions_by_id = {
+        preset_id: _validate_preset_parameters(preset, path + (str(preset_id),))
+        for preset_id, preset in preset_by_id.items()
+    }
+    field_specs = _parameter_action_fields()
+    usage_specs_by_id = {}
+    for preset_id, target_preset in preset_by_id.items():
+        usages = {}
+        target_actions = list(target_preset.get("actions", []) or [])
+        while target_actions:
+            target_action = target_actions.pop()
+            if not isinstance(target_action, dict):
+                continue
+            target_actions.extend(target_action.get("children", []) or [])
+            action_specs = field_specs.get(
+                str(target_action.get("type") or ""), {}
+            )
+            for field, parameter_name in (
+                target_action.get("parameter_bindings", {}) or {}
+            ).items():
+                spec = action_specs.get(str(field))
+                if spec is not None:
+                    usages.setdefault(str(parameter_name), []).append(spec)
+        usage_specs_by_id[preset_id] = usages
+
+    for preset_index, preset in enumerate(presets, 1):
+        if not isinstance(preset, dict):
+            continue
+        preset_path = path + (f"预设 {preset_index}",)
+        own_definitions = _validate_preset_parameters(preset, preset_path)
+        stack = [
+            (action, preset_path + (f"动作 {index}",))
+            for index, action in enumerate(preset.get("actions", []) or [], 1)
+        ]
+        while stack:
+            action, action_path = stack.pop()
+            if not isinstance(action, dict):
+                continue
+            for child_index, child in enumerate(action.get("children", []) or [], 1):
+                stack.append((child, action_path + (f"子动作 {child_index}",)))
+            action_type = str(action.get("type") or "")
+            allowed_fields = field_specs.get(action_type, {})
+            bindings = action.get("parameter_bindings", {}) or {}
+            for field, parameter_name in bindings.items():
+                binding_path = action_path + ("parameter_bindings", str(field))
+                spec = allowed_fields.get(str(field))
+                if spec is None:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 不是该动作可绑定的字段"
+                    )
+                definition = own_definitions.get(str(parameter_name))
+                if definition is None:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 引用了不存在的变量："
+                        f"{parameter_name}"
+                    )
+                kind, minimum, maximum, choices = spec
+                if definition["type"] != kind:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 的变量类型必须是 {kind}"
+                    )
+                value = _validate_parameter_default(definition, binding_path)
+                if choices is not None and value not in choices:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 的默认按键不适用于该动作"
+                    )
+                if minimum is not None and value < minimum:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 的默认值不能小于 {minimum}"
+                    )
+                if maximum is not None and value > maximum:
+                    raise ValueError(
+                        f"{_path_text(binding_path)} 的默认值不能大于 {maximum}"
+                    )
+
+            values = action.get("parameter_values", {}) or {}
+            if "parameter_values" in action and action_type != "调用子宏":
+                raise ValueError(
+                    f"{_path_text(action_path + ('parameter_values',))} "
+                    "只能用于调用子宏"
+                )
+            if action_type != "调用子宏":
+                continue
+            target_id = str(action.get("preset_id") or "")
+            target_definitions = definitions_by_id.get(target_id, {})
+            for parameter_name, value in values.items():
+                value_path = action_path + ("parameter_values", str(parameter_name))
+                definition = target_definitions.get(str(parameter_name))
+                if definition is None:
+                    raise ValueError(
+                        f"{_path_text(value_path)} 不是目标预设声明的变量"
+                    )
+                converted = _validate_parameter_default(
+                    {**definition, "default": value}, value_path
+                )
+                for spec in usage_specs_by_id.get(target_id, {}).get(
+                    str(parameter_name), []
+                ):
+                    _kind, minimum, maximum, choices = spec
+                    if choices is not None and converted not in choices:
+                        raise ValueError(
+                            f"{_path_text(value_path)} 的按键不适用于目标动作"
+                        )
+                    if minimum is not None and converted < minimum:
+                        raise ValueError(
+                            f"{_path_text(value_path)} 不能小于 {minimum}"
+                        )
+                    if maximum is not None and converted > maximum:
+                        raise ValueError(
+                            f"{_path_text(value_path)} 不能大于 {maximum}"
+                        )
+
+
 def validate_preset_payload(preset, index=1, _global_state=None, _path=None):
     path = _path or (f"预设 {index}",)
     _require_dict(preset, path)
+    _validate_preset_parameters(preset, path)
     _validate_optional_fields(preset, {
         "enabled": lambda value: _validate_bool(value, path + ("enabled",)),
         "name": lambda value: _validate_string(value, path + ("name",)),
@@ -676,12 +1043,28 @@ def validate_preset_payload(preset, index=1, _global_state=None, _path=None):
         "loop_interval_jitter_ms": lambda value: _validate_int(value, path + ("loop_interval_jitter_ms",), 0, 600_000),
         "speed_percent": lambda value: _validate_int(value, path + ("speed_percent",), 10, 500),
         "max_runtime_s": lambda value: _validate_int(value, path + ("max_runtime_s",), 0, 86_400),
+        "condition_enabled": lambda value: _validate_bool(
+            value, path + ("condition_enabled",)
+        ),
+        "condition_state": lambda value: _validate_choice(
+            value, path + ("condition_state",), MAPPING_CONDITION_STATES
+        ),
     })
     preset_enabled = bool(preset.get("enabled", False))
     if preset_enabled:
         for required_field in ("trigger_modifiers", "trigger"):
             _require_non_empty_field(preset, required_field, path)
     _validate_hotkey(preset, "trigger_modifiers", "trigger", path, SOURCE_NAMES)
+    if "condition_input" in preset:
+        _validate_choice(
+            preset["condition_input"], path + ("condition_input",),
+            CONDITION_INPUT_NAMES,
+        )
+    if preset.get("condition_enabled"):
+        if "condition_input" not in preset:
+            raise ValueError(f"{_path_text(path + ('condition_input',))} 不能为空")
+        if "condition_state" not in preset:
+            raise ValueError(f"{_path_text(path + ('condition_state',))} 不能为空")
     actions = _require_list(preset.get("actions", []), path + ("actions",))
     if preset_enabled and not actions:
         raise ValueError(f"{_path_text(path + ('actions',))} 不能为空")
@@ -757,6 +1140,8 @@ def _validate_profile(profile, index, seen_ids, totals):
                         "与同一档案中的其他预设重复"
                     )
                 preset_ids.add(preset_id)
+        _validate_submacro_references(presets, payload_path + ("presets",))
+        _validate_parameter_references(presets, payload_path + ("presets",))
 
 
 def validate_config_payload(data, *, allow_profiles=True):
@@ -792,7 +1177,8 @@ def validate_config_payload(data, *, allow_profiles=True):
         "recording_cancel", "recording_finish"
     ):
         _validate_hotkey(
-            data, f"{prefix}_modifiers", f"{prefix}_key", (prefix,), SOURCE_NAMES
+            data, f"{prefix}_modifiers", f"{prefix}_key", (prefix,),
+            SYSTEM_HOTKEY_NAMES,
         )
 
     mappings = _require_list(data.get("mappings", []), ("mappings",))
@@ -815,6 +1201,8 @@ def validate_config_payload(data, *, allow_profiles=True):
             preset, index, _global_state=totals,
             _path=(f"预设 {index}",),
         )
+    _validate_submacro_references(presets, ("presets",))
+    _validate_parameter_references(presets, ("presets",))
 
     if allow_profiles:
         profiles = _require_list(data.get("profiles", []), ("profiles",))

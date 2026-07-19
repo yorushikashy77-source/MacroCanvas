@@ -78,6 +78,35 @@ class InteractionRiskFix52Tests(unittest.TestCase):
         self.assertEqual(harness.engine_hint.text, "配置已修改")
         self.assertEqual(harness.status_refreshes, 1)
 
+    def test_recording_state_cancels_manual_test_countdown(self):
+        harness = _CountdownHarness()
+        harness.recording_session_active = True
+
+        self.assertTrue(harness._runtime_transaction_blocks_manual_test(
+            "test_preset_countdown"
+        ))
+        self.assertEqual(harness._test_countdown_generation, 8)
+        self.assertIsNone(harness._test_countdown_preset_id)
+        self.assertEqual(harness.macro_state, MacroState.IDLE)
+
+    def test_recording_start_cancels_manual_test_countdown(self):
+        recording = (ROOT / "ui" / "recording_workflow.py").read_text("utf-8")
+        method = recording[recording.index("    def begin_recording_countdown"):recording.index(
+            "    def recording_countdown_tick"
+        )]
+        self.assertIn("_cancel_manual_test_countdown", method)
+
+    def test_manual_tests_reject_failed_configuration_state(self):
+        source = (ROOT / "ui" / "action_execution.py").read_text("utf-8")
+        for method_name in ("run_from_current_action", "test_selected_preset"):
+            method = source[source.index(f"    def {method_name}("):].split(
+                "\n    def ", 1
+            )[0]
+            self.assertIn(
+                "self.config_state in (ConfigState.DIRTY, ConfigState.FAILED)",
+                method,
+            )
+
     def test_data_changed_routes_through_countdown_cancellation(self):
         source = (ROOT / "ui" / "editor_workflow.py").read_text("utf-8")
         method = source[source.index("    def data_changed"):source.index(

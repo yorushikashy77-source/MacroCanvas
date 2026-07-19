@@ -488,7 +488,7 @@ class KanataConfigBuilder:
     @classmethod
     def action_output(cls, action):
         kind = action.get("type")
-        if kind in ("等待", LOOP_ACTION_TYPE):
+        if kind in ("等待", LOOP_ACTION_TYPE, *CONTROL_ACTION_TYPES):
             return None
         if kind == "鼠标滚轮":
             direction = "up" if action.get("target") == "向上" else "down"
@@ -722,11 +722,12 @@ class KanataConfigBuilder:
             source = preset.get("trigger", "F1")
             if self.keyboard_hwids_exclude and source not in MOUSE_NAMES:
                 continue
+            condition = kanata_mapping_condition(preset)
             output = self._trigger_action(
                 "preset", preset.get("id"), namespace, scope
             )
             rules_by_source.setdefault(source, []).append((
-                preset.get("trigger_modifiers", "无"), None,
+                preset.get("trigger_modifiers", "无"), condition,
                 output, 1, index, "source"
             ))
         return rules_by_source
@@ -801,6 +802,13 @@ class KanataConfigBuilder:
             for mapping in definition["mappings"]:
                 if mapping.get("enabled") and mapping.get("condition_enabled"):
                     condition_source = mapping.get(
+                        "condition_input", "鼠标左键"
+                    )
+                    remember_source(condition_source)
+                    self._register_condition_state_source(condition_source)
+            for preset in definition["presets"]:
+                if preset.get("enabled") and preset.get("condition_enabled"):
+                    condition_source = preset.get(
                         "condition_input", "鼠标左键"
                     )
                     remember_source(condition_source)

@@ -13,6 +13,7 @@ from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QDialog, QMessageBox
 
 from config.profiles import profile_payload
+from config.diff import merge_config_sections, selected_section_labels
 from config.schema import (
     MAX_CONFIG_FILE_BYTES, repair_duplicate_action_tree_ids,
     repair_duplicate_runtime_ids, repair_overlapping_loop_controls,
@@ -132,12 +133,75 @@ class ConfigPersistenceMixin:
         cancel_countdown = getattr(self, "_cancel_manual_test_countdown", None)
         if callable(cancel_countdown):
             cancel_countdown("已打开备份配置，原测试倒计时已取消")
-        dialog = BackupManagerDialog(CONFIG_BACKUP_DIR, self)
+        current_payload = validate_config_payload(
+            json.loads(json.dumps(self.current_config_payload(), ensure_ascii=False))
+        )
+        dialog = BackupManagerDialog(
+            CONFIG_BACKUP_DIR,
+            self,
+            current_payload=current_payload,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         snapshot = dialog.selected_snapshot()
         if not snapshot or snapshot.get("payload") is None:
             return
+        selected_sections = set(snapshot.get("selected_sections") or [])
+        if not selected_sections:
+            return
+
+        state_name = getattr(self.config_state, "name", "")
+        has_unapplied_changes = state_name == "DIRTY"
+        if state_name == "FAILED":
+            try:
+                has_unapplied_changes = (
+                    self.current_config_signature()
+                    != self.applied_config_signature
+                )
+            except Exception:
+                has_unapplied_changes = True
+        if has_unapplied_changes:
+            answer = QMessageBox.question(
+                self,
+                "先应用当前修改",
+                "选择性恢复会保留未选择区块的当前内容。为了确保恢复失败时"
+                "能够完整回退，需要先成功应用当前修改，再与备份合并。\n\n"
+                "是否先应用当前修改并继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.apply_changes()
+            if getattr(self.config_state, "name", "") in ("DIRTY", "FAILED"):
+                QMessageBox.warning(
+                    self,
+                    "当前修改未能应用",
+                    "程序没有开始恢复备份；请先修正当前配置的应用错误。",
+                )
+                return
+            current_payload = validate_config_payload(
+                json.loads(json.dumps(
+                    self.current_config_payload(), ensure_ascii=False
+                ))
+            )
+        try:
+            restored_payload = validate_config_payload(
+                merge_config_sections(
+                    current_payload,
+                    snapshot["payload"],
+                    selected_sections,
+                )
+            )
+        except (ValueError, TypeError, RecursionError, MemoryError) as error:
+            QMessageBox.warning(
+                self,
+                "无法组合所选恢复范围",
+                "所选区块与当前配置组合后未能通过完整性校验，程序没有修改"
+                f"任何配置。\n\n{error}",
+            )
+            return
+        selected_labels = selected_section_labels(selected_sections)
 
         running_note = (
             "当前输入引擎会暂时停止，恢复完成后自动重新启动。"
@@ -147,10 +211,12 @@ class ConfigPersistenceMixin:
         answer = QMessageBox.question(
             self,
             "恢复备份配置",
-            f"将使用“{snapshot.get('type_label', '配置备份')}”替换当前完整配置。\n"
+            f"将从“{snapshot.get('type_label', '配置备份')}”恢复以下区块：\n"
+            + "\n".join(f"• {label}" for label in selected_labels)
+            + "\n\n"
             f"备份时间：{snapshot.get('time_label', '时间未知')}\n\n"
-            "当前未保存的编辑会被丢弃；恢复前的当前配置会自动保存为一份"
-            "可回退快照。\n"
+            "只有所选区块会被备份内容替换，其他当前配置保持不变。恢复前的"
+            "当前完整配置会自动保存为一份可回退快照。\n"
             f"{running_note}\n\n"
             "是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -166,7 +232,7 @@ class ConfigPersistenceMixin:
         )
         try:
             restored = self._overwrite_full_configuration_in_place(
-                snapshot["payload"]
+                restored_payload
             )
         finally:
             self._end_loading()
@@ -177,7 +243,7 @@ class ConfigPersistenceMixin:
             QMessageBox.information(
                 self,
                 "备份配置已恢复",
-                "所选备份已在当前窗口中载入并保存，不需要重新启动程序。",
+                "所选配置区块已在当前窗口中载入并保存，不需要重新启动程序。",
             )
 
     def _save_config_payload(self, data, create_backup=True):
