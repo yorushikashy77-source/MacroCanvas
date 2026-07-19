@@ -15,6 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.constants import (
+    ACTION_ID_ROLE,
     APP_DIR,
     DIAGNOSTIC_LOG_PATH,
     DIAGNOSTIC_MAX_LINES,
@@ -297,8 +299,60 @@ class RuntimeDiagnosticsMixin:
         )
         return True
 
+    def _runtime_debug_action_item(self, info):
+        preset_id = str((info or {}).get("source_preset_id") or "")
+        action_id = str((info or {}).get("action_id") or "")
+        if not preset_id or not action_id:
+            return None, None
+        card = next(
+            (
+                item for item in getattr(self, "preset_cards", [])
+                if str(getattr(item, "preset_id", "") or "") == preset_id
+            ),
+            None,
+        )
+        if card is None or not getattr(card, "_actions_loaded", False):
+            return card, None
+        for item in card.action_table.iter_items():
+            if str(item.data(0, ACTION_ID_ROLE) or "") == action_id:
+                return card, item
+        return card, None
+
+    def _set_runtime_debug_current_action(self, info):
+        previous = dict(getattr(self, "runtime_debug_current_action", {}) or {})
+        current = dict(info or {})
+        self.runtime_debug_current_action = current
+        for candidate in (previous, current):
+            card, item = self._runtime_debug_action_item(candidate)
+            if card is not None and item is not None:
+                self._update_action_variable_marker(item, card)
+
+    def _locate_runtime_debug_action(self, info=None):
+        info = dict(info or getattr(self, "runtime_debug_current_action", {}) or {})
+        card, item = self._runtime_debug_action_item(info)
+        if card is None:
+            return False
+        if not getattr(card, "_actions_loaded", False):
+            self.ensure_card_actions_loaded(card)
+            card, item = self._runtime_debug_action_item(info)
+        if item is None:
+            return False
+        self.select_preset_card(card)
+        card.action_table.clearSelection()
+        item.setSelected(True)
+        card.action_table.setCurrentItem(item)
+        card.action_table.scrollToItem(item)
+        card.action_dialog.show()
+        card.action_dialog.raise_()
+        card.action_dialog.activateWindow()
+        return True
+
     def open_runtime_debugger(self):
         if self.runtime_debug_dialog is not None:
+            self.macro_controller.set_debug_enabled(True)
+            self.macro_controller.set_debug_breakpoints(
+                getattr(self, "runtime_debug_breakpoints", set())
+            )
             self.runtime_debug_dialog.show()
             self.runtime_debug_dialog.raise_()
             return
@@ -308,13 +362,36 @@ class RuntimeDiagnosticsMixin:
         layout = QVBoxLayout(dialog)
         status = QLabel()
         status.setWordWrap(True)
-        table = QTableWidget(0, 3)
-        table.setHorizontalHeaderLabels(["时间", "事件", "内容"])
+        current_detail = QLabel("当前尚无动作事件")
+        current_detail.setWordWrap(True)
+        current_detail.setObjectName("muted")
+        task_controls = QHBoxLayout()
+        task_picker = QComboBox()
+        task_picker.setMinimumWidth(220)
+        pause_next = QPushButton("下一动作暂停")
+        pause_next.setObjectName("secondary")
+        step = QPushButton("单步")
+        step.setObjectName("secondary")
+        resume = QPushButton("继续")
+        resume.setObjectName("testAction")
+        locate = QPushButton("定位动作")
+        locate.setObjectName("secondary")
+        task_controls.addWidget(QLabel("调试任务"))
+        task_controls.addWidget(task_picker, 1)
+        task_controls.addWidget(pause_next)
+        task_controls.addWidget(step)
+        task_controls.addWidget(resume)
+        task_controls.addWidget(locate)
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["时间", "事件", "调用路径", "内容"])
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(status)
+        layout.addWidget(current_detail)
+        layout.addLayout(task_controls)
         layout.addWidget(table, 1)
         controls = QHBoxLayout()
         clear = QPushButton("清空")
@@ -332,11 +409,13 @@ class RuntimeDiagnosticsMixin:
             table.insertRow(row)
             details = {
                 key: value for key, value in item.items()
-                if key not in ("time", "event", "_seq")
+                if key not in ("time", "event", "_seq", "path")
             }
             table.setItem(row, 0, QTableWidgetItem(item.get("time", "")))
             table.setItem(row, 1, QTableWidgetItem(item.get("event", "")))
-            table.setItem(row, 2, QTableWidgetItem(
+            path = item.get("path", []) or []
+            table.setItem(row, 2, QTableWidgetItem(" → ".join(map(str, path))))
+            table.setItem(row, 3, QTableWidgetItem(
                 json.dumps(details, ensure_ascii=False, default=str)
             ))
 
@@ -383,12 +462,63 @@ class RuntimeDiagnosticsMixin:
             changed = sync_events(events)
             if changed and events:
                 table.scrollToBottom()
-            active = list(self.macro_controller.tasks)
+            with self.macro_controller.lock:
+                active_items = list(self.macro_controller.tasks.items())
+            active = [str(preset_id) for preset_id, _task in active_items]
+            selected_id = str(task_picker.currentData() or "")
+            picker_ids = [
+                str(task_picker.itemData(index) or "")
+                for index in range(task_picker.count())
+            ]
+            if picker_ids != active:
+                task_picker.blockSignals(True)
+                task_picker.clear()
+                for preset_id, task in active_items:
+                    task_picker.addItem(
+                        str(task.preset.get("name") or preset_id), str(preset_id)
+                    )
+                preferred = (
+                    selected_id if selected_id in active
+                    else str(getattr(self, "active_macro_id", "") or "")
+                )
+                index = task_picker.findData(preferred)
+                task_picker.setCurrentIndex(max(0, index))
+                task_picker.blockSignals(False)
+            selected_id = str(task_picker.currentData() or "")
+            task = next(
+                (item for preset_id, item in active_items if str(preset_id) == selected_id),
+                None,
+            )
+            debug_pause = dict(getattr(task, "debug_pause_info", {}) or {})
+            debug_paused = bool(
+                task is not None and debug_pause and not task.run_event.is_set()
+            )
+            pause_next.setEnabled(bool(task and task.run_event.is_set()))
+            step.setEnabled(debug_paused)
+            resume.setEnabled(debug_paused)
+            locate.setEnabled(bool(
+                (debug_pause or getattr(self, "runtime_debug_current_action", {}))
+            ))
             held = self.held_input_snapshot()
             backend = "Interception" if self._runtime_is_game_mode() else "Kanata"
             status.setText(
                 f"输出后端：{backend}　活跃宏：{len(active)}　"
+                f"断点：{len(getattr(self, 'runtime_debug_breakpoints', set()))}　"
                 f"程序按住：{held or '无'}"
+            )
+            detail = debug_pause or dict(
+                getattr(self, "runtime_debug_current_action", {}) or {}
+            )
+            path = " → ".join(map(str, detail.get("path", []) or [])) or "—"
+            parameters = detail.get("parameters", {}) or {}
+            reason = {
+                "breakpoint": "命中断点",
+                "step": "单步暂停",
+            }.get(str(detail.get("reason") or ""), "当前动作")
+            current_detail.setText(
+                f"{reason}：{detail.get('action', detail.get('action_type', '—'))}　"
+                f"路径：{path}　参数："
+                f"{json.dumps(parameters, ensure_ascii=False, default=str) if parameters else '无'}"
             )
 
         def clear_events():
@@ -400,13 +530,45 @@ class RuntimeDiagnosticsMixin:
             timer.stop()
             self.runtime_debug_enabled = False
             self.runtime_debug_dialog = None
+            self.macro_controller.set_debug_enabled(False)
+
+        def selected_task_id():
+            return str(task_picker.currentData() or "")
+
+        def pause_at_next_action():
+            self.macro_controller.debug_pause_next_action(selected_task_id())
+            refresh()
+
+        def step_once():
+            self.macro_controller.debug_step(selected_task_id())
+            refresh()
+
+        def continue_run():
+            self.macro_controller.debug_continue(selected_task_id())
+            refresh()
+
+        def locate_action():
+            with self.macro_controller.lock:
+                task = self.macro_controller.tasks.get(selected_task_id())
+            info = dict(getattr(task, "debug_pause_info", {}) or {}) if task else {}
+            self._locate_runtime_debug_action(
+                info or getattr(self, "runtime_debug_current_action", {})
+            )
 
         clear.clicked.connect(clear_events)
+        pause_next.clicked.connect(pause_at_next_action)
+        step.clicked.connect(step_once)
+        resume.clicked.connect(continue_run)
+        locate.clicked.connect(locate_action)
         close.clicked.connect(dialog.close)
         dialog.finished.connect(finished)
         timer.timeout.connect(refresh)
         self.runtime_debug_enabled = True
         self.runtime_debug_dialog = dialog
+        self.macro_controller.set_debug_breakpoints(
+            getattr(self, "runtime_debug_breakpoints", set())
+        )
+        self.macro_controller.set_debug_enabled(True)
         refresh()
         timer.start()
         dialog.show()

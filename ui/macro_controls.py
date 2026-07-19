@@ -293,19 +293,50 @@ class MacroControlsMixin:
         preset_name = str(info.get("name") or "预设")
         action_text = str(info.get("action") or "动作")
         self.active_macro_id = info.get("id") or self.active_macro_id
-        self.last_action_activity = {
-            "id": self.active_macro_id,
-            "name": preset_name,
+        self.last_action_activity = dict(info)
+        self.last_action_activity.update({
+            "id": self.active_macro_id, "name": preset_name,
             "action": action_text,
-        }
+        })
+        if hasattr(self, "_set_runtime_debug_current_action"):
+            self._set_runtime_debug_current_action(self.last_action_activity)
         phase = str(info.get("phase") or "start")
+        if hasattr(self, "write_diagnostic"):
+            self.write_diagnostic(
+                "macro_action_activity",
+                preset_id=self.active_macro_id,
+                preset=preset_name,
+                action=action_text,
+                phase=phase,
+                action_id=str(info.get("action_id") or ""),
+                action_type=str(info.get("action_type") or ""),
+                source_preset_id=str(info.get("source_preset_id") or ""),
+                path=list(info.get("path", []) or []),
+                parameters=dict(info.get("parameters", {}) or {}),
+                reason=str(info.get("debug_reason") or ""),
+            )
+        if phase == "debug_pause":
+            self.macro_state = MacroState.PAUSED
+            self._sync_macro_pause_display(True)
+            self.refresh_status_ui()
+            self.refresh_macro_controls()
+            return
+        if phase == "finished":
+            return
         if phase == "error":
             if hasattr(self, "write_diagnostic"):
+                failure_kind = str(
+                    info.get("debug_reason") or info.get("error_type") or ""
+                )
                 self.write_diagnostic(
                     (
                         "macro_parallel_action_failed"
-                        if info.get("error_type") == "parallel_exception"
-                        else "macro_action_release_failed"
+                        if failure_kind == "parallel_exception"
+                        else "macro_condition_timeout"
+                        if failure_kind == "condition_timeout"
+                        else "macro_submacro_failed"
+                        if failure_kind == "submacro_unavailable"
+                        else "macro_action_failed"
                     ),
                     force=True,
                     preset_id=self.active_macro_id,
@@ -501,6 +532,8 @@ class MacroControlsMixin:
                         )
                     self.macro_state = MacroState.IDLE
                     self.last_action_activity = {}
+                    if hasattr(self, "_set_runtime_debug_current_action"):
+                        self._set_runtime_debug_current_action({})
                     if hasattr(self, "activity_overlay") and not getattr(
                         self, "recording_session_active", False
                     ):

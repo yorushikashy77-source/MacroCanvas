@@ -59,26 +59,53 @@ class EditorWorkflowMixin:
             None,
         )
 
-    def _update_action_variable_marker(self, item):
+    def _update_action_variable_marker(self, item, card=None):
         if item is None or self.is_condition_branch_item(item):
             return
+        card = card or self._card_for_action_table(item.treeWidget())
         bindings = dict(item.data(0, ACTION_PARAMETER_BINDINGS_ROLE) or {})
         values = dict(item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {})
+        action_id = str(item.data(0, ACTION_ID_ROLE) or "")
+        preset_id = str(getattr(card, "preset_id", "") or "")
+        key = (preset_id, action_id)
+        breakpoints = set(getattr(self, "runtime_debug_breakpoints", set()) or set())
+        current = dict(getattr(self, "runtime_debug_current_action", {}) or {})
         base = (
             "循环卡片" if self.is_loop_action_item(item)
             else "子动作" if item.parent() is not None else "动作"
         )
-        item.setText(0, base + (" ◇" if bindings or values else ""))
-        original_tip = str(item.toolTip(0) or "").split("\n变量：", 1)[0]
+        markers = []
+        if (
+            preset_id
+            and action_id
+            and str(current.get("source_preset_id") or "") == preset_id
+            and str(current.get("action_id") or "") == action_id
+        ):
+            markers.append("▶")
+        if preset_id and action_id and key in breakpoints:
+            markers.append("●")
+        if bindings or values:
+            markers.append("◇")
+        item.setText(0, base + (" " + "".join(markers) if markers else ""))
+        original_tip = str(item.toolTip(0) or "")
+        for section in ("\n变量：", "\n调试："):
+            original_tip = original_tip.split(section, 1)[0]
         details = []
         if bindings:
             details.append(f"已绑定 {len(bindings)} 个字段")
         if values:
             details.append(f"已覆盖 {len(values)} 个子宏变量")
-        item.setToolTip(
-            0,
-            original_tip + ("\n变量：" + "；".join(details) if details else ""),
-        )
+        debug_details = []
+        if key in breakpoints:
+            debug_details.append("本次会话已设置断点")
+        if markers and markers[0] == "▶":
+            debug_details.append("当前正在执行")
+        tip = original_tip
+        if details:
+            tip += "\n变量：" + "；".join(details)
+        if debug_details:
+            tip += "\n调试：" + "；".join(debug_details)
+        item.setToolTip(0, tip)
 
     def edit_preset_variables(self, card):
         """Edit named defaults declared by one reusable preset."""
@@ -198,6 +225,93 @@ class EditorWorkflowMixin:
         else:
             self._edit_action_parameter_bindings(card, item, action)
 
+    def toggle_selected_action_breakpoints(self, card):
+        selected = [
+            item for item in self.selected_action_items(card)
+            if not self.is_condition_branch_item(item)
+        ]
+        if not selected:
+            QMessageBox.information(
+                card.action_dialog,
+                "请选择动作",
+                "请先选择一个或多个普通动作、控制动作或循环卡片。",
+            )
+            return False
+        preset_id = str(getattr(card, "preset_id", "") or "")
+        keys = {
+            (preset_id, str(item.data(0, ACTION_ID_ROLE) or ""))
+            for item in selected
+            if preset_id and str(item.data(0, ACTION_ID_ROLE) or "")
+        }
+        if not keys:
+            return False
+        breakpoints = set(getattr(self, "runtime_debug_breakpoints", set()) or set())
+        enabling = not keys.issubset(breakpoints)
+        if enabling:
+            breakpoints.update(keys)
+        else:
+            breakpoints.difference_update(keys)
+        self.runtime_debug_breakpoints = breakpoints
+        controller = getattr(self, "macro_controller", None)
+        if controller is not None:
+            controller.set_debug_breakpoints(breakpoints)
+        for item in selected:
+            self._update_action_variable_marker(item, card)
+        if enabling and hasattr(self, "open_runtime_debugger"):
+            self.open_runtime_debugger()
+        if hasattr(self, "engine_hint"):
+            self.engine_hint.setStyleSheet("")
+            self.engine_hint.setText(
+                f"已为 {len(keys)} 个动作{'设置' if enabling else '移除'}本次会话断点"
+            )
+        return True
+
+    def _prune_runtime_debug_breakpoints(
+        self, card=None, removed_preset_id="",
+    ):
+        breakpoints = set(getattr(self, "runtime_debug_breakpoints", set()) or set())
+        original = set(breakpoints)
+        removed_preset_id = str(removed_preset_id or "")
+        current = dict(getattr(self, "runtime_debug_current_action", {}) or {})
+        current_key = (
+            str(current.get("source_preset_id") or ""),
+            str(current.get("action_id") or ""),
+        )
+        current_invalid = False
+        if removed_preset_id:
+            breakpoints = {
+                key for key in breakpoints if str(key[0]) != removed_preset_id
+            }
+            current_invalid = current_key[0] == removed_preset_id
+        elif card is not None and getattr(card, "_actions_loaded", False):
+            preset_id = str(getattr(card, "preset_id", "") or "")
+            valid_ids = {
+                str(item.data(0, ACTION_ID_ROLE) or "")
+                for item in card.action_table.iter_items()
+                if str(item.data(0, ACTION_ID_ROLE) or "")
+            }
+            breakpoints = {
+                key for key in breakpoints
+                if str(key[0]) != preset_id or str(key[1]) in valid_ids
+            }
+            current_invalid = (
+                current_key[0] == preset_id
+                and bool(current_key[1])
+                and current_key[1] not in valid_ids
+            )
+        if breakpoints == original and not current_invalid:
+            return False
+        self.runtime_debug_breakpoints = breakpoints
+        controller = getattr(self, "macro_controller", None)
+        if controller is not None and breakpoints != original:
+            controller.set_debug_breakpoints(breakpoints)
+        if current_invalid:
+            if hasattr(self, "_set_runtime_debug_current_action"):
+                self._set_runtime_debug_current_action({})
+            else:
+                self.runtime_debug_current_action = {}
+        return True
+
     def _edit_action_parameter_bindings(self, card, item, action):
         fields = ACTION_PARAMETER_FIELDS.get(action.get("type"), {})
         definitions = self._preset_parameter_definitions(card)
@@ -251,7 +365,7 @@ class EditorWorkflowMixin:
             data = dict(item.data(0, LOOP_DATA_ROLE) or {})
             data["parameter_bindings"] = bindings
             item.setData(0, LOOP_DATA_ROLE, data)
-        self._update_action_variable_marker(item)
+        self._update_action_variable_marker(item, card)
         self.action_changed(card)
 
     def _edit_submacro_parameter_values(self, card, item, action):
@@ -337,7 +451,7 @@ class EditorWorkflowMixin:
             raw = editor.currentText() if isinstance(editor, QComboBox) else editor.value()
             values[name] = coerce_parameter_value(definition["type"], raw)
         item.setData(0, ACTION_PARAMETER_VALUES_ROLE, values)
-        self._update_action_variable_marker(item)
+        self._update_action_variable_marker(item, card)
         self.action_changed(card)
 
     def _sanitize_named_parameter_metadata(self):
@@ -425,7 +539,7 @@ class EditorWorkflowMixin:
                         except ValueError:
                             continue
                     item.setData(0, ACTION_PARAMETER_VALUES_ROLE, values)
-                self._update_action_variable_marker(item)
+                self._update_action_variable_marker(item, card)
 
     @staticmethod
     def semantic_action_count(actions):
@@ -1484,7 +1598,7 @@ class EditorWorkflowMixin:
             self.update_condition_branch_summary(table, item)
         if parent_item is not None and self.is_condition_branch_item(parent_item):
             self.update_condition_branch_summary(table, parent_item)
-        self._update_action_variable_marker(item)
+        self._update_action_variable_marker(item, card)
         if not getattr(self, "_bulk_loading_actions", False):
             table.setCurrentItem(item)
             self.update_card_action_summary(card)
@@ -1637,6 +1751,7 @@ class EditorWorkflowMixin:
                 parent.removeChild(item)
                 self.update_condition_branch_summary(card.action_table, parent)
             self.update_card_action_summary(card)
+            self._prune_runtime_debug_breakpoints(card)
             self.action_changed(card)
         finally:
             if own_loading:
@@ -1731,6 +1846,7 @@ class EditorWorkflowMixin:
             card._pending_action_count = action_count
             self.update_card_action_summary(card)
             self._loading_checkpoint(force=True)
+            self._prune_runtime_debug_breakpoints(card)
             return True
         finally:
             if own_loading:
@@ -2236,6 +2352,7 @@ class EditorWorkflowMixin:
                     card.action_table, branch_parent
                 )
             self.update_card_action_summary(card)
+            self._prune_runtime_debug_breakpoints(card)
             self.action_changed(card)
         finally:
             if own_loading:
@@ -2261,6 +2378,7 @@ class EditorWorkflowMixin:
             try:
                 self.reset_loop_point_selection(card)
                 card.action_table.clear()
+                self._prune_runtime_debug_breakpoints(card)
                 self.update_card_action_summary(card)
                 self.action_changed(card)
             finally:

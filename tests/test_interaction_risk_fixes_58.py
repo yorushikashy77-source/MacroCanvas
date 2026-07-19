@@ -33,7 +33,17 @@ class InteractionRiskFix58StaticTests(unittest.TestCase):
         start = source.index("    def run(self):")
         end = source.index("class MacroController", start)
         block = source[start:end]
-        self.assertIn("if not actions or not self.is_active():\n                return", block)
+        self.assertIn(
+            'if not actions:\n                self.finish_reason = "empty"\n'
+            '                return',
+            block,
+        )
+        self.assertIn(
+            'if not self.is_active():\n'
+            '                self.finish_reason = "backend_inactive"\n'
+            '                return',
+            block,
+        )
         self.assertIn("self._emit_task_finished_once()", block)
         self.assertNotIn('self.signals.task_finished.emit(self.preset["id"])', block)
         ast.parse(source)

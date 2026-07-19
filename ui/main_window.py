@@ -260,6 +260,8 @@ class MainWindow(
         self.runtime_debug_lock = threading.RLock()
         self.runtime_debug_sequence = 0
         self.runtime_debug_dialog = None
+        self.runtime_debug_breakpoints = set()
+        self.runtime_debug_current_action = {}
         self.engine = KanataEngine()
         self.engine.set_message_callback(self._receive_kanata_message)
         self.keyboard_engine = KanataEngine(

@@ -11,7 +11,7 @@ from core.constants import (
     WAIT_CONDITION_ACTION_TYPE,
 )
 from macro.actions import clone_action_tree
-from macro.parameters import resolve_action_parameters
+from macro.parameters import merged_parameter_values, resolve_action_parameters
 from engine.window_context import (
     foreground_window_identity,
     foreground_window_identity_matches,
@@ -35,6 +35,7 @@ class MacroTask:
         self, preset, engine, signals,
         expect_output=None, send_output=None, is_active=None,
         profile_active=None, quarantine_release=None, condition_state=None,
+        debug_state=None,
     ):
         # Resolve root defaults before action IDs and loop references are
         # indexed. Presets without named parameters retain the legacy action
@@ -56,6 +57,15 @@ class MacroTask:
         self.profile_active = profile_active
         self.quarantine_release = quarantine_release
         self.condition_state = condition_state
+        self.debug_state = debug_state
+        self.debug_lock = threading.RLock()
+        self.debug_pause_info = None
+        self.debug_pause_next = False
+        self.finish_reason = ""
+        self.last_failure_reason = ""
+        self.root_debug_parameters = (
+            merged_parameter_values(preset) if preset.get("parameters") else {}
+        )
         self.stop_event = threading.Event()
         self.run_event = threading.Event()
         self.run_event.set()
@@ -118,6 +128,110 @@ class MacroTask:
                 if action_id:
                     self.action_index[action_id] = action
             self._index_preset_actions(action.get("children", []))
+
+    def _debug_snapshot(self):
+        if not callable(self.debug_state):
+            return {"enabled": False, "breakpoints": set()}
+        try:
+            raw = dict(self.debug_state() or {})
+        except Exception:
+            return {"enabled": False, "breakpoints": set()}
+        breakpoints = {
+            (str(item[0]), str(item[1]))
+            for item in raw.get("breakpoints", set()) or set()
+            if isinstance(item, (tuple, list)) and len(item) == 2
+        }
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "breakpoints": breakpoints,
+        }
+
+    def _debug_action_context(self, action):
+        path = list(action.get("_debug_path", []) or [])
+        if not path:
+            path = [str(self.preset.get("name") or "预设")]
+        return {
+            "source_preset_id": str(
+                action.get("_debug_preset_id") or self.preset.get("id") or ""
+            ),
+            "source_preset_name": str(
+                action.get("_debug_preset_name")
+                or self.preset.get("name") or "预设"
+            ),
+            "action_id": str(action.get("action_id") or ""),
+            "action_type": str(action.get("type") or "动作"),
+            "path": path,
+            "parameters": dict(
+                action.get("_debug_parameters", self.root_debug_parameters) or {}
+            ),
+        }
+
+    def _debug_before_action(self, action):
+        snapshot = self._debug_snapshot()
+        if not snapshot["enabled"]:
+            return True
+        context = self._debug_action_context(action)
+        key = (context["source_preset_id"], context["action_id"])
+        wait_for_existing_pause = False
+        with self.debug_lock:
+            if not self.run_event.is_set():
+                wait_for_existing_pause = True
+            else:
+                reason = ""
+                if self.debug_pause_next:
+                    reason = "step"
+                elif context["action_id"] and key in snapshot["breakpoints"]:
+                    reason = "breakpoint"
+                if not reason:
+                    return True
+                self.debug_pause_next = False
+                if not self.pause():
+                    return False
+                self.debug_pause_info = {
+                    **context,
+                    "reason": reason,
+                    "action": self.describe(action),
+                }
+                self._emit_action_activity(
+                    action,
+                    phase="debug_pause",
+                    debug_reason=reason,
+                )
+        if wait_for_existing_pause:
+            if not self.wait_ready():
+                return False
+            # Another parallel branch owned the previous pause. Re-evaluate
+            # this action after it resumes so single-step and its own
+            # breakpoint cannot be skipped by the earlier branch.
+            return self._debug_before_action(action)
+        return self.wait_ready()
+
+    def debug_pause_next_action(self):
+        if self.stop_event.is_set() or not self.run_event.is_set():
+            return False
+        with self.debug_lock:
+            self.debug_pause_next = True
+        return True
+
+    def cancel_pending_debug_pause(self):
+        with self.debug_lock:
+            self.debug_pause_next = False
+
+    def debug_step(self):
+        with self.debug_lock:
+            if self.run_event.is_set() or not self.debug_pause_info:
+                return False
+            self.debug_pause_info = None
+            self.debug_pause_next = True
+        return self.resume(preserve_debug=True)
+
+    def debug_continue(self):
+        with self.debug_lock:
+            if self.run_event.is_set() or not self.debug_pause_info:
+                return False
+            self.debug_pause_info = None
+            self.debug_pause_next = False
+        return self.resume(preserve_debug=True)
 
     def _resolve_loop_targets(self, action):
         targets = []
@@ -264,8 +378,13 @@ class MacroTask:
         self.thread.start()
 
     def stop(self):
+        if not self.finish_reason:
+            self.finish_reason = "stopped"
         self.stop_event.set()
         self.run_event.set()
+        with self.debug_lock:
+            self.debug_pause_info = None
+            self.debug_pause_next = False
         # Wait until an in-flight Press/Tap has either completed its ownership
         # bookkeeping or been rejected by the new stop state.
         with self.output_state_lock:
@@ -275,6 +394,9 @@ class MacroTask:
         return True
 
     def pause(self):
+        with self.debug_lock:
+            self.debug_pause_info = None
+            self.debug_pause_next = False
         with self.clock_lock:
             if self.stop_event.is_set():
                 return False
@@ -299,7 +421,11 @@ class MacroTask:
                 return False
             return True
 
-    def resume(self):
+    def resume(self, preserve_debug=False):
+        if not preserve_debug:
+            with self.debug_lock:
+                self.debug_pause_info = None
+                self.debug_pause_next = False
         with self.output_state_lock:
             with self.clock_lock:
                 if self.run_event.is_set() or self.stop_event.is_set():
@@ -343,15 +469,18 @@ class MacroTask:
         while not self.stop_event.is_set():
             deadline = float(getattr(self, "deadline", 0.0) or 0.0)
             if deadline and self.active_elapsed() >= deadline:
+                self.finish_reason = "runtime_limit"
                 self.stop_event.set()
                 return False
             if not self.is_active():
+                self.finish_reason = "backend_inactive"
                 self.stop_event.set()
                 return False
             if self.run_event.wait(0.05):
                 if self.stop_event.is_set():
                     return False
                 if not self.is_active():
+                    self.finish_reason = "backend_inactive"
                     self.stop_event.set()
                     return False
                 return True
@@ -757,16 +886,21 @@ class MacroTask:
                 self.paused_actions.clear()
             return self.release_all()
 
-    def _emit_action_activity(self, action, phase="start", extra=""):
+    def _emit_action_activity(
+        self, action, phase="start", extra="", debug_reason="",
+    ):
         try:
             description = self.describe(action)
             if extra:
                 description = f"{description} · {extra}"
+            context = self._debug_action_context(action)
             self.signals.action_activity.emit({
                 "id": self.preset.get("id", ""),
                 "name": self.preset.get("name", "预设"),
                 "action": description,
                 "phase": phase,
+                "debug_reason": str(debug_reason or ""),
+                **context,
             })
         except Exception:
             pass
@@ -862,6 +996,8 @@ class MacroTask:
         )
         if not targets:
             return True
+        if not self._debug_before_action(action):
+            return False
         self._emit_action_activity(action)
         mode = mode_override or action.get("execution_mode", "执行次数")
         cycles = (
@@ -1006,17 +1142,26 @@ class MacroTask:
             if self._condition_satisfied(action):
                 return True
             if timeout_ms and (self.active_elapsed() - started) * 1000 >= timeout_ms:
+                self.last_failure_reason = "condition_timeout"
+                self.finish_reason = "condition_timeout"
                 return False
             if self.stop_event.wait(poll_ms / 1000):
                 return False
         return False
 
     @staticmethod
-    def _mark_submacro_call_stack(actions, stack):
+    def _mark_submacro_call_stack(
+        actions, stack, preset_id="", preset_name="", path=None,
+        parameters=None,
+    ):
         copied = clone_action_tree(actions)
         pending = list(copied)
         while pending:
             action = pending.pop()
+            action["_debug_preset_id"] = str(preset_id or "")
+            action["_debug_preset_name"] = str(preset_name or "预设")
+            action["_debug_path"] = list(path or [])
+            action["_debug_parameters"] = dict(parameters or {})
             if action.get("type") == SUBMACRO_ACTION_TYPE:
                 action["_call_stack"] = tuple(stack)
             pending.extend(action.get("children", []) or [])
@@ -1028,11 +1173,17 @@ class MacroTask:
         target = library.get(target_id) if isinstance(library, dict) else None
         stack = tuple(action.get("_call_stack") or (self.preset.get("id"),))
         if not target or not target_id or target_id in stack or len(stack) >= 16:
+            self.last_failure_reason = "submacro_unavailable"
+            self.finish_reason = "submacro_unavailable"
             return False
         repeat_count = max(1, min(100_000, int(action.get("repeat_count", 1))))
         local_speed = max(10, min(500, int(action.get("speed_percent", 100))))
         effective_speed = max(
             10, min(500, round(parent_speed * local_speed / 100))
+        )
+        parameter_values = (
+            merged_parameter_values(target, action.get("parameter_values", {}))
+            if target.get("parameters") else {}
         )
         resolved_actions = (
             resolve_action_parameters(
@@ -1043,7 +1194,15 @@ class MacroTask:
             else target.get("actions", [])
         )
         called_actions = self._mark_submacro_call_stack(
-            resolved_actions, stack + (target_id,)
+            resolved_actions,
+            stack + (target_id,),
+            preset_id=target_id,
+            preset_name=str(target.get("name") or target_id),
+            path=(
+                list(action.get("_debug_path", []) or [])
+                or [str(self.preset.get("name") or "预设")]
+            ) + [str(target.get("name") or target_id)],
+            parameters=parameter_values,
         )
         self._emit_action_activity(action, extra=target.get("name", target_id))
         for _index in range(repeat_count):
@@ -1059,6 +1218,8 @@ class MacroTask:
         if root_action.get("type") == LOOP_ACTION_TYPE:
             # Loop cards are control metadata and are never normal action nodes.
             return True
+        if not self._debug_before_action(root_action):
+            return False
         kind = root_action.get("type")
         if kind == CONDITION_ACTION_TYPE:
             self._emit_action_activity(root_action)
@@ -1081,6 +1242,13 @@ class MacroTask:
         if kind == WAIT_CONDITION_ACTION_TYPE:
             self._emit_action_activity(root_action)
             if not self._wait_for_condition(root_action):
+                if self.last_failure_reason and not self.stop_event.is_set():
+                    self._emit_action_activity(
+                        root_action,
+                        phase="error",
+                        extra="条件等待超时，当前宏结束",
+                        debug_reason=self.last_failure_reason,
+                    )
                 return False
             return self._run_action_sequence(
                 root_action.get("children", []) or [], speed,
@@ -1088,6 +1256,16 @@ class MacroTask:
             )
         if kind == SUBMACRO_ACTION_TYPE:
             if not self._run_submacro(root_action, speed):
+                if (
+                    self.last_failure_reason == "submacro_unavailable"
+                    and not self.stop_event.is_set()
+                ):
+                    self._emit_action_activity(
+                        root_action,
+                        phase="error",
+                        extra="子宏无法继续执行",
+                        debug_reason=self.last_failure_reason,
+                    )
                 return False
             return self._run_action_sequence(
                 root_action.get("children", []) or [], speed,
@@ -1192,9 +1370,15 @@ class MacroTask:
         interval_jitter = int(self.preset.get("loop_interval_jitter_ms", 0))
         max_seconds = int(self.preset.get("max_runtime_s", 0))
         try:
-            if not actions or not self.is_active():
+            if not actions:
+                self.finish_reason = "empty"
+                return
+            if not self.is_active():
+                self.finish_reason = "backend_inactive"
                 return
             if not self._wait_for_trigger_release():
+                if not self.finish_reason:
+                    self.finish_reason = "trigger_release_cancelled"
                 return
             # Trigger-release waiting is input isolation, not macro runtime. Do
             # not charge it against finite runtime or action timing.
@@ -1242,6 +1426,11 @@ class MacroTask:
                     ordinary_actions, speed, timeline_mode="sequential",
                     local_stop=self.stop_event, progress_callback=emit_progress,
                 ):
+                    if not self.finish_reason:
+                        self.finish_reason = (
+                            "stopped" if self.stop_event.is_set()
+                            else self.last_failure_reason or "action_failed"
+                        )
                     break
                 if (
                     self.stop_event.is_set()
@@ -1259,11 +1448,41 @@ class MacroTask:
                 if not current_interval and not self.sleep(1):
                     break
         finally:
+            if not self.finish_reason:
+                self.finish_reason = (
+                    "stopped" if self.stop_event.is_set() else "completed"
+                )
             # Stop any branch that outlived the main sequence and give it a
             # bounded chance to leave backend calls before final release.
             self.stop_event.set()
             self.wait_for_exit(timeout=2.0)
-            self.release_all()
+            if not self.release_all():
+                self.finish_reason = "release_failed"
+            reason_labels = {
+                "completed": "正常完成",
+                "stopped": "已停止",
+                "empty": "没有动作",
+                "runtime_limit": "达到最长运行时间",
+                "backend_inactive": "输入后端不可用",
+                "trigger_release_cancelled": "等待触发键释放时结束",
+                "condition_timeout": "等待条件超时",
+                "submacro_unavailable": "子宏不可用或形成循环",
+                "action_failed": "动作执行失败",
+                "release_failed": "结束时按键释放失败",
+            }
+            self.signals.action_activity.emit({
+                "id": self.preset.get("id", ""),
+                "name": self.preset.get("name", "预设"),
+                "action": f"宏结束：{reason_labels.get(self.finish_reason, self.finish_reason)}",
+                "phase": "finished",
+                "finish_reason": self.finish_reason,
+                "source_preset_id": str(self.preset.get("id") or ""),
+                "source_preset_name": str(self.preset.get("name") or "预设"),
+                "action_id": "",
+                "action_type": "宏结束",
+                "path": [str(self.preset.get("name") or "预设")],
+                "parameters": dict(self.root_debug_parameters),
+            })
             self._emit_task_finished_once()
 
 
@@ -1283,6 +1502,58 @@ class MacroController:
         self.tasks = {}
         self.lock = threading.RLock()
         self.last_release_failures = []
+        self.debug_enabled = False
+        self.debug_breakpoints = set()
+        self.debug_lock = threading.RLock()
+
+    def _debug_snapshot(self):
+        with self.debug_lock:
+            return {
+                "enabled": bool(self.debug_enabled),
+                "breakpoints": set(self.debug_breakpoints),
+            }
+
+    def set_debug_enabled(self, enabled):
+        with self.debug_lock:
+            self.debug_enabled = bool(enabled)
+        if not enabled:
+            with self.lock:
+                tasks = list(self.tasks.values())
+            for task in tasks:
+                task.cancel_pending_debug_pause()
+        self.signals.state_changed.emit()
+
+    def set_debug_breakpoints(self, breakpoints):
+        normalized = {
+            (str(item[0]), str(item[1]))
+            for item in breakpoints or set()
+            if isinstance(item, (tuple, list)) and len(item) == 2
+            and str(item[0]) and str(item[1])
+        }
+        with self.debug_lock:
+            self.debug_breakpoints = normalized
+        self.signals.state_changed.emit()
+
+    def debug_pause_next_action(self, preset_id):
+        with self.lock:
+            task = self.tasks.get(preset_id)
+        return bool(task and task.debug_pause_next_action())
+
+    def debug_step(self, preset_id):
+        with self.lock:
+            task = self.tasks.get(preset_id)
+        success = bool(task and task.debug_step())
+        if success:
+            self.signals.state_changed.emit()
+        return success
+
+    def debug_continue(self, preset_id):
+        with self.lock:
+            task = self.tasks.get(preset_id)
+        success = bool(task and task.debug_continue())
+        if success:
+            self.signals.state_changed.emit()
+        return success
 
     def _remember_release_failure_locked(self, preset_id):
         preset_id = str(preset_id or "")
@@ -1314,6 +1585,7 @@ class MacroController:
                 self.expect_output, self.send_output, self.is_active,
                 self.profile_active, self.quarantine_release,
                 self.condition_state,
+                self._debug_snapshot,
             )
             self.tasks[preset_id] = task
             task.start()

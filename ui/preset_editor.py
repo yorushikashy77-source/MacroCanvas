@@ -235,8 +235,18 @@ class PresetEditorMixin:
             lambda _checked=False, c=card:
             self.edit_selected_action_variables(c)
         )
+        action_breakpoint = QPushButton("断点")
+        action_breakpoint.setObjectName("secondary")
+        action_breakpoint.setToolTip(
+            "为选中动作设置或移除本次程序会话断点；设置后会打开运行调试器"
+        )
+        action_breakpoint.clicked.connect(
+            lambda _checked=False, c=card:
+            self.toggle_selected_action_breakpoints(c)
+        )
         action_header.addWidget(define_variables)
         action_header.addWidget(action_variables)
+        action_header.addWidget(action_breakpoint)
         action_header.addStretch()
         up = QPushButton("↑")
         up.setToolTip("在同一层级内上移")
@@ -821,6 +831,9 @@ class PresetEditorMixin:
             card.action_dialog.close()
             card.action_dialog.deleteLater()
         self.preset_cards.remove(card)
+        self._prune_runtime_debug_breakpoints(
+            removed_preset_id=str(preset_id or "")
+        )
         self.preset_layout.removeWidget(card)
         card.deleteLater()
 
