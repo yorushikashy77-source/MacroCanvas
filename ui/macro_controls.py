@@ -50,6 +50,11 @@ class MacroControlsMixin:
         started_at = float(getattr(task, "history_started_at", 0.0) or finished_at)
         status, detail = self._macro_finish_summary(task)
         origin_id = str(preset.get("_origin_preset_id") or task_id)
+        action_context = dict(getattr(task, "last_action_context", {}) or {})
+        failure_action = (
+            str(action_context.get("action") or "")
+            if status == "失败" else ""
+        )
         entry = {
             "finished_at": finished_at,
             "preset_id": origin_id,
@@ -60,6 +65,11 @@ class MacroControlsMixin:
             "status": status,
             "detail": detail,
             "duration_ms": max(0, round((finished_at - started_at) * 1000)),
+            "failure_action": failure_action,
+            "action_preset_id": str(
+                action_context.get("source_preset_id") or origin_id
+            ),
+            "action_id": str(action_context.get("action_id") or ""),
         }
         history = list(getattr(self, "macro_run_history", []) or [])
         history.insert(0, entry)
@@ -81,8 +91,10 @@ class MacroControlsMixin:
         layout = QVBoxLayout(dialog)
         hint = QTreeWidget()
         hint.setObjectName("macroRunHistory")
-        hint.setColumnCount(6)
-        hint.setHeaderLabels(["结束时间", "宏", "触发来源", "结果", "耗时", "说明"])
+        hint.setColumnCount(7)
+        hint.setHeaderLabels([
+            "结束时间", "宏", "触发来源", "结果", "耗时", "问题动作", "说明",
+        ])
         hint.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
         hint.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         hint.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -90,6 +102,7 @@ class MacroControlsMixin:
         hint.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         hint.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         hint.header().setSectionResizeMode(5, QHeaderView.Stretch)
+        hint.header().setSectionResizeMode(6, QHeaderView.Stretch)
         history = list(getattr(self, "macro_run_history", []) or [])
         for entry in history:
             timestamp = datetime.fromtimestamp(entry["finished_at"]).strftime(
@@ -97,13 +110,15 @@ class MacroControlsMixin:
             )
             row = QTreeWidgetItem([
                 timestamp, entry["preset_name"], entry["source"],
-                entry["status"], f"{entry['duration_ms']} ms", entry["detail"],
+                entry["status"], f"{entry['duration_ms']} ms",
+                entry.get("failure_action", "—") or "—", entry["detail"],
             ])
-            row.setData(0, 32, entry["preset_id"])
+            row.setData(0, 32, entry.get("action_preset_id") or entry["preset_id"])
+            row.setData(1, 32, entry.get("action_id", ""))
             hint.addTopLevelItem(row)
         if not history:
             hint.addTopLevelItem(QTreeWidgetItem([
-                "—", "—", "—", "暂无记录", "—",
+                "—", "—", "—", "暂无记录", "—", "—",
                 "本次启动后完成的宏会显示在这里。",
             ]))
         layout.addWidget(hint, 1)
@@ -117,6 +132,7 @@ class MacroControlsMixin:
         def locate_selected(*_args):
             row = hint.currentItem()
             preset_id = str(row.data(0, 32) or "") if row is not None else ""
+            action_id = str(row.data(1, 32) or "") if row is not None else ""
             card = next(
                 (item for item in getattr(self, "preset_cards", [])
                  if str(item.preset_id) == preset_id),
@@ -125,6 +141,9 @@ class MacroControlsMixin:
             if card is not None:
                 dialog.accept()
                 self.open_preset_actions_dialog(card)
+                focus = getattr(self, "_focus_submacro_overview_action", None)
+                if callable(focus) and action_id:
+                    focus(card, action_id)
 
         hint.itemDoubleClicked.connect(locate_selected)
         layout.addWidget(buttons)

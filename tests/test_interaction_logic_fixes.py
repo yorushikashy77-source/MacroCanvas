@@ -220,6 +220,7 @@ class InteractionLogicFixTests(unittest.TestCase):
             },
             history_started_at=time.time() - 0.125,
             finish_reason="completed",
+            last_action_context={},
         )
         entry = harness._record_macro_run_history(completed)
         self.assertEqual(entry["preset_name"], "技能连招")
@@ -228,12 +229,25 @@ class InteractionLogicFixTests(unittest.TestCase):
         self.assertGreaterEqual(entry["duration_ms"], 100)
         self.assertEqual(len(harness.macro_run_history), 1)
 
+        failed = SimpleNamespace(
+            preset={"id": "preset-a", "name": "技能连招"},
+            history_started_at=time.time(), finish_reason="condition_timeout",
+            last_action_context={
+                "action": "等待条件 Space", "source_preset_id": "child",
+                "action_id": "wait-space",
+            },
+        )
+        failure = harness._record_macro_run_history(failed)
+        self.assertEqual(failure["failure_action"], "等待条件 Space")
+        self.assertEqual(failure["action_preset_id"], "child")
+        self.assertEqual(failure["action_id"], "wait-space")
+
         mapping = SimpleNamespace(
             preset={"id": "mapping:basic", "name": "基础映射"},
             history_started_at=time.time(), finish_reason="completed",
         )
         self.assertIsNone(harness._record_macro_run_history(mapping))
-        self.assertEqual(len(harness.macro_run_history), 1)
+        self.assertEqual(len(harness.macro_run_history), 2)
 
     def test_finish_hotkey_during_countdown_does_not_cancel(self):
         harness = _RecordingHarness()

@@ -63,6 +63,7 @@ class MacroTask:
         self.debug_pause_next = False
         self.finish_reason = ""
         self.last_failure_reason = ""
+        self.last_action_context = {}
         self.root_debug_parameters = (
             merged_parameter_values(preset) if preset.get("parameters") else {}
         )
@@ -909,6 +910,15 @@ class MacroTask:
             if extra:
                 description = f"{description} · {extra}"
             context = self._debug_action_context(action)
+            self.last_action_context = {
+                "action": description,
+                "phase": str(phase or "start"),
+                "source_preset_id": str(
+                    context.get("source_preset_id") or self.preset.get("id") or ""
+                ),
+                "action_id": str(context.get("action_id") or ""),
+                "path": list(context.get("path", []) or []),
+            }
             self.signals.action_activity.emit({
                 "id": self.preset.get("id", ""),
                 "name": self.preset.get("name", "预设"),
