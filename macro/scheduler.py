@@ -917,6 +917,7 @@ class MacroTask:
                     context.get("source_preset_id") or self.preset.get("id") or ""
                 ),
                 "action_id": str(context.get("action_id") or ""),
+                "action_type": str(context.get("action_type") or ""),
                 "path": list(context.get("path", []) or []),
             }
             self.signals.action_activity.emit({

@@ -66,6 +66,9 @@ class MacroControlsMixin:
             "detail": detail,
             "duration_ms": max(0, round((finished_at - started_at) * 1000)),
             "failure_action": failure_action,
+            "failure_action_type": str(
+                action_context.get("action_type") or ""
+            ),
             "action_preset_id": str(
                 action_context.get("source_preset_id") or origin_id
             ),
@@ -115,6 +118,7 @@ class MacroControlsMixin:
             ])
             row.setData(0, 32, entry.get("action_preset_id") or entry["preset_id"])
             row.setData(1, 32, entry.get("action_id", ""))
+            row.setData(6, 32, entry)
             hint.addTopLevelItem(row)
         if not history:
             hint.addTopLevelItem(QTreeWidgetItem([
@@ -125,9 +129,29 @@ class MacroControlsMixin:
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         clear = QPushButton("清空")
         clear.setObjectName("dangerGhost")
+        export_failure = QPushButton("导出失败诊断包")
+        export_failure.setObjectName("secondary")
+        export_failure.setEnabled(False)
         buttons.addButton(clear, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(export_failure, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(dialog.reject)
         clear.clicked.connect(self.clear_macro_run_history)
+
+        def update_export_state(current, _previous=None):
+            entry = current.data(6, 32) if current is not None else None
+            export_failure.setEnabled(
+                isinstance(entry, dict) and entry.get("status") == "失败"
+            )
+
+        def export_selected_failure():
+            row = hint.currentItem()
+            entry = row.data(6, 32) if row is not None else None
+            exporter = getattr(self, "export_failed_run_diagnostic_bundle", None)
+            if isinstance(entry, dict) and callable(exporter):
+                exporter(entry)
+
+        hint.currentItemChanged.connect(update_export_state)
+        export_failure.clicked.connect(export_selected_failure)
 
         def locate_selected(*_args):
             row = hint.currentItem()

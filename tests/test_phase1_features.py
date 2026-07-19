@@ -217,6 +217,35 @@ class DiagnosticBundleTests(unittest.TestCase):
                 cleaned = archive.read("logs/diagnostic.log").decode("utf-8")
                 self.assertNotIn("private", cleaned)
 
+    def test_bundle_writes_redacted_failure_context_payloads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            destination = root / "failure-bundle.zip"
+            write_diagnostic_bundle(
+                destination,
+                {"application": "MacroCanvas"},
+                {"preset_count": 1},
+                [],
+                home=root,
+                extra_payloads=(
+                    ("failed-run.json", {
+                        "preset_name": "private preset",
+                        "source": "F1",
+                        "failure_action_type": "等待条件",
+                    }),
+                    ("health-check.json", {"issue_count": 2}),
+                ),
+            )
+            with zipfile.ZipFile(destination) as archive:
+                self.assertIn("context/failed-run.json", archive.namelist())
+                self.assertIn("context/health-check.json", archive.namelist())
+                context = json.loads(
+                    archive.read("context/failed-run.json").decode("utf-8")
+                )
+                self.assertEqual(context["preset_name"], REDACTED)
+                self.assertEqual(context["source"], REDACTED)
+                self.assertEqual(context["failure_action_type"], "等待条件")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,7 +67,9 @@ def redact_log_text(text, home=None):
     return "\n".join(output) + ("\n" if output else "")
 
 
-def write_diagnostic_bundle(destination, summary, config_summary, log_paths, home=None):
+def write_diagnostic_bundle(
+    destination, summary, config_summary, log_paths, home=None, extra_payloads=(),
+):
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     included = []
@@ -86,6 +88,16 @@ def write_diagnostic_bundle(destination, summary, config_summary, log_paths, hom
                 indent=2,
             ),
         )
+        for label, payload in extra_payloads or ():
+            safe_label = str(label or "context.json").replace("\\", "_").replace("/", "_")
+            archive.writestr(
+                f"context/{safe_label}",
+                json.dumps(
+                    redact_payload(payload, home=home),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
         for label, path in log_paths:
             path = Path(path)
             if not path.is_file():

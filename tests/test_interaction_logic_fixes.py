@@ -239,6 +239,7 @@ class InteractionLogicFixTests(unittest.TestCase):
         )
         failure = harness._record_macro_run_history(failed)
         self.assertEqual(failure["failure_action"], "等待条件 Space")
+        self.assertEqual(failure["failure_action_type"], "")
         self.assertEqual(failure["action_preset_id"], "child")
         self.assertEqual(failure["action_id"], "wait-space")
 

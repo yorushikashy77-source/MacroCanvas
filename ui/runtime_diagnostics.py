@@ -319,6 +319,94 @@ class RuntimeDiagnosticsMixin:
         )
         return True
 
+    def export_failed_run_diagnostic_bundle(self, entry):
+        """Export a redacted bundle scoped to one selected failed run."""
+        entry = dict(entry or {})
+        if str(entry.get("status") or "") != "失败":
+            QMessageBox.information(self, "无法导出", "请选择一条失败的宏运行记录。")
+            return False
+        blocked, snapshot = operation_blocks(self, "diagnostic_export")
+        if blocked:
+            QMessageBox.information(
+                self, "无法导出诊断包", f"{snapshot.label}，无法开始新的导出。"
+            )
+            return False
+        suggested = str(Path.home() / "Desktop" / "MacroCanvas-失败诊断包.zip")
+        destination, _filter = QFileDialog.getSaveFileName(
+            self, "导出失败诊断包", suggested, "ZIP 压缩包 (*.zip)"
+        )
+        if not destination:
+            return False
+        if not destination.casefold().endswith(".zip"):
+            destination += ".zip"
+        health_issues = []
+        health_checker = getattr(self, "current_preset_health_issues", None)
+        if callable(health_checker):
+            health_issues = list(health_checker() or [])
+
+        def health_category(issue):
+            text = str((issue or {}).get("description") or "")
+            if "子宏" in text:
+                return "子宏引用"
+            if "变量" in text:
+                return "变量引用"
+            if "循环" in text:
+                return "循环引用"
+            return "其他方案检查项"
+
+        categories = Counter(health_category(issue) for issue in health_issues)
+        failure_context = {
+            "result": str(entry.get("status") or "失败"),
+            "reason": str(entry.get("detail") or ""),
+            "duration_ms": int(entry.get("duration_ms") or 0),
+            "failure_action_type": str(entry.get("failure_action_type") or ""),
+            "failure_action_recorded": bool(entry.get("failure_action")),
+            "failure_action_location_recorded": bool(entry.get("action_id")),
+        }
+        health_context = {
+            "issue_count": len(health_issues),
+            "issue_categories": dict(sorted(categories.items())),
+        }
+        try:
+            self._flush_diagnostic_queue(timeout=0.5)
+            operation = operation_state_snapshot(self)
+            with self.macro_controller.lock:
+                active_tasks = len(self.macro_controller.tasks)
+            summary = {
+                "application": "MacroCanvas",
+                "bundle_kind": "failed_macro_run",
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "operation": operation.to_dict(),
+                "engine_running": bool(getattr(self, "running", False)),
+                "active_macro_count": active_tasks,
+                "failed_run": failure_context,
+            }
+            included = write_diagnostic_bundle(
+                destination,
+                summary,
+                self._diagnostic_configuration_summary(),
+                (
+                    ("diagnostic.log", DIAGNOSTIC_LOG_PATH),
+                    ("kanata.log", KANATA_LOG_PATH),
+                    ("kanata-keyboard.log", KANATA_KEYBOARD_LOG_PATH),
+                ),
+                home=Path.home(),
+                extra_payloads=(("failed-run.json", failure_context),
+                                ("health-check.json", health_context)),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            QMessageBox.warning(self, "导出失败", f"诊断包未能生成：\n{error}")
+            return False
+        QMessageBox.information(
+            self,
+            "导出完成",
+            f"失败诊断包已保存：\n{destination}\n\n"
+            f"包含 {len(included)} 份可用日志、失败摘要和方案检查结果；原始配置未写入压缩包。",
+        )
+        return True
+
     def _runtime_debug_action_item(self, info):
         preset_id = str((info or {}).get("source_preset_id") or "")
         action_id = str((info or {}).get("action_id") or "")
