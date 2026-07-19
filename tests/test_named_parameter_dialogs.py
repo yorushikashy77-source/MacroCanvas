@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QLabel, QLineEdit, QPushButton, QTableWidget,
+    QLabel, QLineEdit, QPushButton, QTableWidget, QTreeWidget,
 )
 
 from ui.editors import ActionTreeWidget
@@ -331,6 +331,47 @@ class NamedParameterDialogTests(unittest.TestCase):
         rebuilt = harness.action_from_item(root.action_table, call)
         self.assertNotIn("parameter_values", rebuilt)
         self.assertNotIn("◇", call.text(0))
+
+    def test_submacro_overview_shows_resolved_impact_and_locates_call(self):
+        harness = _DialogHarness()
+        child = _card("child", [{
+            "name": "技能键", "type": "按键", "default": "A",
+        }])
+        root = _card("root")
+        harness.preset_cards.extend([root, child])
+        harness.add_action({
+            "action_id": "key", "type": "键盘点击", "target": "A",
+            "hold_ms": 20, "parameter_bindings": {"target": "技能键"},
+            "children": [],
+        }, save=False, card=child)
+        call = harness.add_action({
+            "action_id": "call", "type": "调用子宏",
+            "preset_id": "child", "repeat_count": 1, "speed_percent": 100,
+            "parameter_values": {"技能键": "B"}, "children": [],
+        }, save=False, card=root)
+
+        def inspect_overview(dialog):
+            tree = dialog.findChild(QTreeWidget, "submacroCallOverview")
+            self.assertIsNotNone(tree)
+            self.assertEqual(tree.topLevelItemCount(), 1)
+            overview_row = tree.topLevelItem(0)
+            self.assertEqual(overview_row.text(1), "child")
+            self.assertIn("技能键=B（覆盖）", overview_row.text(2))
+            self.assertIn("键盘点击·目标按键", overview_row.text(3))
+            self.assertEqual(overview_row.childCount(), 1)
+            self.assertIn("B · 按住 20 ms", overview_row.child(0).text(1))
+
+            tree.setCurrentItem(overview_row.child(0))
+            locate = next(
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == "定位调用"
+            )
+            locate.click()
+            self.assertIs(root.action_table.currentItem(), call)
+
+        self.run_dialog_action(
+            lambda: harness.open_submacro_call_overview(root), inspect_overview
+        )
 
 
 if __name__ == "__main__":

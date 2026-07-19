@@ -44,6 +44,7 @@ ACTION_LEGACY_MODIFIERS_ROLE = ACTION_RECORDING_CONTEXT_ROLE + 1
 ACTION_BRANCH_TYPE_ROLE = ACTION_LEGACY_MODIFIERS_ROLE + 1
 ACTION_PARAMETER_BINDINGS_ROLE = ACTION_BRANCH_TYPE_ROLE + 1
 ACTION_PARAMETER_VALUES_ROLE = ACTION_PARAMETER_BINDINGS_ROLE + 1
+SUBMACRO_OVERVIEW_ACTION_ID_ROLE = ACTION_PARAMETER_VALUES_ROLE + 1
 
 
 def _select_editor_table_cell(editor, table):
@@ -532,6 +533,195 @@ class EditorWorkflowMixin:
         if action_type == LOOP_ACTION_TYPE:
             return action_type, str(action.get("name") or "循环项目")
         return action_type, ""
+
+    def _submacro_call_overview_entries(self, card):
+        """Collect this preset's child-macro calls with their resolved impact."""
+        source_actions = self.collect_visible_actions(card)
+        cards_by_id = {
+            str(other.preset_id): other for other in self.preset_cards
+        }
+        entries = []
+
+        def walk(actions, path=()):
+            for index, source_action in enumerate(actions or [], 1):
+                current_path = path + (index,)
+                if source_action.get("type") == SUBMACRO_ACTION_TYPE:
+                    target_id = str(source_action.get("preset_id") or "")
+                    target_card = cards_by_id.get(target_id)
+                    definitions = self._preset_parameter_definitions(target_card)
+                    target_actions = (
+                        self.collect_visible_actions(target_card)
+                        if target_card is not None else []
+                    )
+                    overrides = dict(source_action.get("parameter_values", {}) or {})
+                    resolved_values = {
+                        definition["name"]: overrides.get(
+                            definition["name"], definition["default"]
+                        )
+                        for definition in definitions
+                    }
+                    usages = self._submacro_parameter_usage_details(target_actions)
+                    impacts = []
+                    for name, value in resolved_values.items():
+                        fields = usages.get(name, [])
+                        if not fields:
+                            continue
+                        labels = "、".join(
+                            f"{detail['action_type']}·"
+                            f"{FIELD_LABELS.get(detail['field'], detail['field'])}"
+                            for detail in fields
+                        )
+                        impacts.append(f"{name} → {labels}")
+                    entries.append({
+                        "action_id": str(source_action.get("action_id") or ""),
+                        "path": " / ".join(
+                            f"动作 {position}" for position in current_path
+                        ),
+                        "target_id": target_id,
+                        "target_name": (
+                            target_card.name.text().strip() or "未命名预设"
+                            if target_card is not None else "目标预设已不存在"
+                        ),
+                        "overrides": overrides,
+                        "definitions": definitions,
+                        "resolved_values": resolved_values,
+                        "impacts": impacts,
+                        "resolved_actions": resolve_action_parameters(
+                            target_actions, {"parameters": definitions}, overrides
+                        ) if target_card is not None else [],
+                    })
+                walk(source_action.get("children", []), current_path)
+
+        walk(source_actions)
+        return entries
+
+    def _focus_submacro_overview_action(self, card, action_id):
+        """Select the call action represented by an overview row."""
+        if not action_id:
+            return False
+        for item in card.action_table.iter_items():
+            if str(item.data(0, ACTION_ID_ROLE) or "") != action_id:
+                continue
+            card.action_table.setCurrentItem(item)
+            item.setSelected(True)
+            card.action_table.scrollToItem(
+                item, QAbstractItemView.ScrollHint.PositionAtCenter
+            )
+            return True
+        return False
+
+    def open_submacro_call_overview(self, card=None):
+        """Show calls, overrides and resolved child actions for one preset."""
+        card = card or self.selected_preset_card
+        if card is None:
+            return
+        self.select_preset_card(card)
+        entries = self._submacro_call_overview_entries(card)
+        if not entries:
+            QMessageBox.information(
+                getattr(card, "action_dialog", None) or self,
+                "暂无子宏调用",
+                "当前预设没有“调用子宏”动作。添加子宏后，这里会显示变量覆盖和执行流程。",
+            )
+            return
+        dialog = QDialog(getattr(card, "action_dialog", None) or self)
+        dialog.setWindowTitle("子宏调用总览")
+        dialog.resize(900, 620)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "每一行代表当前预设的一次子宏调用。展开后可查看本次变量值实际作用到的动作；"
+            "选中任意行后可定位回原调用动作。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+        tree = QTreeWidget()
+        tree.setObjectName("submacroCallOverview")
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["调用位置", "子宏", "本次变量", "实际影响"])
+        tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree.setRootIsDecorated(True)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        layout.addWidget(tree, 1)
+        preset_names = {
+            str(other.preset_id): other.name.text().strip() or "未命名预设"
+            for other in self.preset_cards
+        }
+
+        def add_preview_actions(actions, parent, definitions, resolved_values):
+            definitions_by_name = {
+                definition["name"]: definition for definition in definitions
+            }
+            for preview_action in actions or []:
+                action_type, detail = self._submacro_preview_action_details(
+                    preview_action, preset_names
+                )
+                sources = []
+                for _field, name in (
+                    preview_action.get("parameter_bindings", {}) or {}
+                ).items():
+                    definition = definitions_by_name.get(name)
+                    if definition is not None and name in resolved_values:
+                        value_text = self._format_parameter_preview_value(
+                            definition["type"], resolved_values[name]
+                        )
+                        sources.append(f"{name}={value_text}")
+                action_row = QTreeWidgetItem([
+                    f"└ {action_type}", detail, "；".join(sources), "",
+                ])
+                parent.addChild(action_row)
+                add_preview_actions(
+                    preview_action.get("children", []), action_row,
+                    definitions, resolved_values,
+                )
+
+        for entry in entries:
+            override_text = []
+            for definition in entry["definitions"]:
+                name = definition["name"]
+                value = entry["resolved_values"].get(name, definition["default"])
+                source = "覆盖" if name in entry["overrides"] else "默认"
+                value_text = self._format_parameter_preview_value(
+                    definition["type"], value
+                )
+                override_text.append(f"{name}={value_text}（{source}）")
+            root = QTreeWidgetItem([
+                entry["path"], entry["target_name"],
+                "；".join(override_text) or "未定义变量",
+                "；".join(entry["impacts"]) or "没有变量影响",
+            ])
+            root.setData(0, SUBMACRO_OVERVIEW_ACTION_ID_ROLE, entry["action_id"])
+            tree.addTopLevelItem(root)
+            add_preview_actions(
+                entry["resolved_actions"], root, entry["definitions"],
+                entry["resolved_values"],
+            )
+        tree.expandAll()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        locate = QPushButton("定位调用")
+        locate.setObjectName("secondary")
+        buttons.addButton(locate, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+
+        def locate_selected():
+            selected = tree.currentItem()
+            while selected is not None and selected.parent() is not None:
+                selected = selected.parent()
+            action_id = (
+                str(selected.data(0, SUBMACRO_OVERVIEW_ACTION_ID_ROLE) or "")
+                if selected is not None else ""
+            )
+            if self._focus_submacro_overview_action(card, action_id):
+                dialog.accept()
+
+        locate.clicked.connect(locate_selected)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _edit_submacro_parameter_values(self, card, item, action):
         target_id = str(action.get("preset_id") or "")

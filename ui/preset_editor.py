@@ -235,6 +235,14 @@ class PresetEditorMixin:
             lambda _checked=False, c=card:
             self.edit_selected_action_variables(c)
         )
+        submacro_overview = QPushButton("子宏总览")
+        submacro_overview.setObjectName("secondary")
+        submacro_overview.setToolTip(
+            "查看当前预设调用的子宏、每次变量覆盖及实际影响；可定位回调用动作"
+        )
+        submacro_overview.clicked.connect(
+            lambda _checked=False, c=card: self.open_submacro_call_overview(c)
+        )
         action_breakpoint = QPushButton("断点")
         action_breakpoint.setObjectName("secondary")
         action_breakpoint.setToolTip(
@@ -246,6 +254,7 @@ class PresetEditorMixin:
         )
         action_header.addWidget(define_variables)
         action_header.addWidget(action_variables)
+        action_header.addWidget(submacro_overview)
         action_header.addWidget(action_breakpoint)
         action_header.addStretch()
         up = QPushButton("↑")
@@ -453,7 +462,8 @@ class PresetEditorMixin:
             "选中分支后使用上方按钮添加动作，也可在两个分支间拖动普通动作。"
             "“子宏”可调用同一配置方案中的其他预设，并单独设置次数与速度。"
             "“定义变量”可声明按键、整数和时长默认值；“动作变量”可让选中动作引用变量，"
-            "或在调用子宏时覆盖目标预设的默认值。"
+            "或在调用子宏时覆盖目标预设的默认值。“子宏总览”可查看各次调用的变量覆盖、"
+            "实际影响，并定位回原调用动作。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("muted")
