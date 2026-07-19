@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import uuid
+import weakref
 
 from PySide6.QtCore import QEvent, QSize, QTimer, Qt, Slot
 from PySide6.QtGui import QColor
@@ -43,6 +44,42 @@ ACTION_LEGACY_MODIFIERS_ROLE = ACTION_RECORDING_CONTEXT_ROLE + 1
 ACTION_BRANCH_TYPE_ROLE = ACTION_LEGACY_MODIFIERS_ROLE + 1
 ACTION_PARAMETER_BINDINGS_ROLE = ACTION_BRANCH_TYPE_ROLE + 1
 ACTION_PARAMETER_VALUES_ROLE = ACTION_PARAMETER_BINDINGS_ROLE + 1
+
+
+def _select_editor_table_cell(editor, table):
+    viewport = table.viewport()
+    position = editor.mapTo(viewport, editor.rect().center())
+    index = table.indexAt(position)
+    if index.isValid():
+        table.setCurrentCell(index.row(), index.column())
+
+
+class _TableCellLineEdit(QLineEdit):
+    """A permanent cell editor that also selects its containing row."""
+
+    def __init__(self, text, table):
+        super().__init__(text)
+        self._table_ref = weakref.ref(table)
+
+    def focusInEvent(self, event):
+        table = self._table_ref()
+        if table is not None:
+            _select_editor_table_cell(self, table)
+        super().focusInEvent(event)
+
+
+class _TableCellComboBox(QComboBox):
+    """A permanent combo editor that also selects its containing row."""
+
+    def __init__(self, table):
+        super().__init__()
+        self._table_ref = weakref.ref(table)
+
+    def focusInEvent(self, event):
+        table = self._table_ref()
+        if table is not None:
+            _select_editor_table_cell(self, table)
+        super().focusInEvent(event)
 
 
 class EditorWorkflowMixin:
@@ -129,7 +166,11 @@ class EditorWorkflowMixin:
         layout.addWidget(table, 1)
 
         def add_row(definition=None):
-            if table.rowCount() >= MAX_PRESET_PARAMETERS:
+            active_rows = [
+                row for row in range(table.rowCount())
+                if not table.isRowHidden(row)
+            ]
+            if len(active_rows) >= MAX_PRESET_PARAMETERS:
                 QMessageBox.information(
                     dialog, "已达到上限",
                     f"每个预设最多可定义 {MAX_PRESET_PARAMETERS} 个变量。",
@@ -138,24 +179,31 @@ class EditorWorkflowMixin:
             definition = dict(definition or {})
             row = table.rowCount()
             table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(str(definition.get("name") or "")))
-            kind = QComboBox()
+            name = _TableCellLineEdit(
+                str(definition.get("name") or ""), table
+            )
+            name.setPlaceholderText("变量名称")
+            table.setCellWidget(row, 0, name)
+            kind = _TableCellComboBox(table)
             kind.addItems(PARAMETER_TYPES)
             kind.setCurrentText(str(definition.get("type") or PARAMETER_INPUT))
             table.setCellWidget(row, 1, kind)
-            # The global input style adds vertical padding and margins.  Qt's
-            # default table row is shorter than the resulting editor size hint,
-            # which clips both the combo text and in-place item editors.
+            default = _TableCellLineEdit(
+                str(definition.get("default", "A")), table
+            )
+            default.setPlaceholderText("默认值")
+            table.setCellWidget(row, 2, default)
+            # Permanent editors avoid Qt 6.11's unsafe delegate-editor teardown
+            # when the dialog closes, while the adaptive row height keeps the
+            # styled controls from being clipped at different font scales.
             table.setRowHeight(
                 row,
                 max(
                     kind.sizeHint().height() + 8,
+                    name.sizeHint().height() + 8,
+                    default.sizeHint().height() + 8,
                     table.fontMetrics().height() + 24,
                 ),
-            )
-            table.setItem(
-                row, 2,
-                QTableWidgetItem(str(definition.get("default", "A"))),
             )
 
         for definition in self._preset_parameter_definitions(card):
@@ -166,9 +214,28 @@ class EditorWorkflowMixin:
         add_button.clicked.connect(lambda _checked=False: add_row())
         remove_button = QPushButton("删除选中")
         remove_button.setObjectName("dangerGhost")
+
+        def remove_selected_row():
+            row = table.currentRow()
+            if row < 0 or table.isRowHidden(row):
+                return
+            # Removing a row while one of its permanent editors owns focus can
+            # make Qt 6.11 destroy the widget twice during dialog teardown.
+            # Keep it hidden until the table itself is safely destroyed.
+            remove_button.setFocus(Qt.FocusReason.OtherFocusReason)
+            table.setRowHidden(row, True)
+            remaining = [
+                candidate for candidate in range(table.rowCount())
+                if not table.isRowHidden(candidate)
+            ]
+            if remaining:
+                table.setCurrentCell(remaining[min(row, len(remaining) - 1)], 0)
+            else:
+                table.clearSelection()
+                table.setCurrentCell(-1, -1)
+
         remove_button.clicked.connect(
-            lambda _checked=False: table.removeRow(table.currentRow())
-            if table.currentRow() >= 0 else None
+            lambda _checked=False: remove_selected_row()
         )
         row_buttons.addWidget(add_button)
         row_buttons.addWidget(remove_button)
@@ -184,13 +251,19 @@ class EditorWorkflowMixin:
         def accept():
             definitions = []
             names = set()
+            visible_index = 0
             for row in range(table.rowCount()):
-                name_item = table.item(row, 0)
-                default_item = table.item(row, 2)
-                name = str(name_item.text() if name_item else "").strip()
+                if table.isRowHidden(row):
+                    continue
+                visible_index += 1
+                name_editor = table.cellWidget(row, 0)
+                default_editor = table.cellWidget(row, 2)
+                name = str(name_editor.text() if name_editor else "").strip()
                 kind = table.cellWidget(row, 1).currentText()
                 if not name:
-                    QMessageBox.warning(dialog, "变量无效", f"第 {row + 1} 行没有名称。")
+                    QMessageBox.warning(
+                        dialog, "变量无效", f"第 {visible_index} 行没有名称。"
+                    )
                     return
                 if len(name) > 32:
                     QMessageBox.warning(dialog, "变量无效", f"变量“{name}”名称超过 32 个字符。")
@@ -200,7 +273,7 @@ class EditorWorkflowMixin:
                     return
                 try:
                     default = coerce_parameter_value(
-                        kind, default_item.text() if default_item else ""
+                        kind, default_editor.text() if default_editor else ""
                     )
                 except ValueError as error:
                     QMessageBox.warning(
@@ -215,7 +288,14 @@ class EditorWorkflowMixin:
             dialog.accept()
 
         buttons.accepted.connect(accept)
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            # Dispose the editor tree while the event loop is still alive.
+            # Leaving several closed dialogs queued until interpreter shutdown
+            # makes Qt 6.11 tear their item views down after Python finalization.
+            dialog.deleteLater()
+            QApplication.sendPostedEvents(dialog, QEvent.Type.DeferredDelete)
 
     def edit_selected_action_variables(self, card):
         selected = [

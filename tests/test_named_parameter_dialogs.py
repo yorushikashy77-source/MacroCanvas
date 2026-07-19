@@ -101,9 +101,9 @@ class NamedParameterDialogTests(unittest.TestCase):
             add.click()
             table = dialog.findChild(QTableWidget)
             self.assertEqual(table.rowCount(), 1)
-            table.item(0, 0).setText("目标键")
+            table.cellWidget(0, 0).setText("目标键")
             table.cellWidget(0, 1).setCurrentText("按键")
-            table.item(0, 2).setText("A")
+            table.cellWidget(0, 2).setText("A")
             _dialog_button(
                 dialog, QDialogButtonBox.StandardButton.Ok
             ).click()
@@ -117,7 +117,7 @@ class NamedParameterDialogTests(unittest.TestCase):
 
         def change_then_cancel(dialog):
             table = dialog.findChild(QTableWidget)
-            table.item(0, 2).setText("B")
+            table.cellWidget(0, 2).setText("B")
             _dialog_button(
                 dialog, QDialogButtonBox.StandardButton.Cancel
             ).click()
@@ -141,23 +141,76 @@ class NamedParameterDialogTests(unittest.TestCase):
             add.click()
             table = dialog.findChild(QTableWidget)
             combo = table.cellWidget(0, 1)
+            name = table.cellWidget(0, 0)
+            default = table.cellWidget(0, 2)
             QApplication.processEvents()
 
             self.assertGreaterEqual(combo.height(), combo.sizeHint().height())
+            self.assertGreaterEqual(name.height(), name.sizeHint().height())
+            self.assertGreaterEqual(default.height(), default.sizeHint().height())
             self.assertGreaterEqual(
                 table.rowHeight(0), table.fontMetrics().height() + 24
             )
-
-            table.editItem(table.item(0, 2))
-            QApplication.processEvents()
-            editor = table.findChild(QLineEdit)
-            self.assertIsNotNone(editor)
-            self.assertGreaterEqual(editor.height(), editor.sizeHint().height())
             dialog.reject()
 
         self.run_dialog_action(
             lambda: harness.edit_preset_variables(card), inspect_editor_sizes
         )
+
+    def test_variable_definition_cell_editor_selects_row_for_removal(self):
+        harness = _DialogHarness()
+        card = _card("child", [
+            {"name": "第一个", "type": "按键", "default": "A"},
+            {"name": "第二个", "type": "按键", "default": "B"},
+        ])
+        harness.preset_cards.append(card)
+
+        def remove_first_row(dialog):
+            table = dialog.findChild(QTableWidget)
+            first_name = table.cellWidget(0, 0)
+            remove = next(
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == "删除选中"
+            )
+            table.cellWidget(1, 0).setFocus()
+            QApplication.processEvents()
+            first_name.setFocus()
+            QApplication.processEvents()
+            remove.click()
+            self.assertTrue(table.isRowHidden(0))
+            self.assertFalse(table.isRowHidden(1))
+            self.assertEqual(table.cellWidget(1, 0).text(), "第二个")
+            _dialog_button(
+                dialog, QDialogButtonBox.StandardButton.Ok
+            ).click()
+
+        self.run_dialog_action(
+            lambda: harness.edit_preset_variables(card), remove_first_row
+        )
+        self.assertEqual(card.parameter_definitions, [
+            {"name": "第二个", "type": "按键", "default": "B"},
+        ])
+
+    def test_variable_definition_dialog_reopens_and_saves_repeatedly(self):
+        harness = _DialogHarness()
+        card = _card("child", [
+            {"name": "目标键", "type": "按键", "default": "A"},
+        ])
+        harness.preset_cards.append(card)
+
+        for value in ("B", "C", "D", "E", "F", "G"):
+            def update_and_save(dialog, selected=value):
+                table = dialog.findChild(QTableWidget)
+                table.cellWidget(0, 2).setText(selected)
+                _dialog_button(
+                    dialog, QDialogButtonBox.StandardButton.Ok
+                ).click()
+
+            self.run_dialog_action(
+                lambda: harness.edit_preset_variables(card), update_and_save
+            )
+
+        self.assertEqual(card.parameter_definitions[0]["default"], "G")
 
     def test_action_binding_dialog_marks_and_rebuilds_the_row(self):
         harness = _DialogHarness()
