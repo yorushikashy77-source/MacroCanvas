@@ -31,6 +31,20 @@ class _Signals:
         self.state_changed = _Signal()
 
 
+class _OverlayStub:
+    def __init__(self):
+        self.messages = []
+        self.hidden_generations = []
+
+    def show_message(self, title, detail="", accent="#38bdf8"):
+        self.messages.append((title, detail, accent))
+        return len(self.messages)
+
+    def hide_message(self, generation=None):
+        self.hidden_generations.append(generation)
+        return True
+
+
 class _Engine:
     @staticmethod
     def is_running():
@@ -55,6 +69,17 @@ def _wait_until(predicate, timeout=1.5):
         if predicate():
             return True
         time.sleep(0.005)
+    return bool(predicate())
+
+
+def _wait_until_events(app, predicate, timeout=1.5):
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    app.processEvents()
     return bool(predicate())
 
 
@@ -467,6 +492,9 @@ class _RuntimeDialogHarness(RuntimeDiagnosticsMixin, QDialog):
         self.macro_controller = MacroController(_Engine(), is_active=lambda: True)
         self.active_macro_id = None
         self.preset_cards = []
+        self.activity_overlay = _OverlayStub()
+        self.recording_session_active = False
+        self.runtime_debug_resume_delay_seconds = 0.02
 
     @staticmethod
     def held_input_snapshot():
@@ -579,6 +607,118 @@ class RuntimeDebuggerQtTests(unittest.TestCase):
         finally:
             task.stop()
             task.wait_for_exit(timeout=1.0)
+
+    def test_delayed_debug_step_uses_status_overlay_before_resuming(self):
+        harness = _RuntimeDialogHarness()
+        harness._runtime_debug_resume_target_ready = lambda _task: (True, "")
+        harness.open_runtime_debugger()
+        sent = []
+
+        def send(action, phase, **_kwargs):
+            sent.append((action.get("target"), phase))
+            return True
+
+        task = MacroTask(
+            _preset("root", [
+                {
+                    "action_id": "first", "type": "键盘点击",
+                    "target": "A", "hold_ms": 1,
+                },
+                {
+                    "action_id": "second", "type": "键盘点击",
+                    "target": "B", "hold_ms": 1,
+                },
+            ]),
+            _Engine(), _Signals(), send_output=send,
+            is_active=lambda: True,
+            debug_state=harness.macro_controller._debug_snapshot,
+        )
+        harness.macro_controller.tasks["root"] = task
+        task.start()
+        try:
+            self.assertTrue(_wait_until_events(
+                self.app,
+                lambda: (task.debug_pause_info or {}).get("action_id") == "first",
+            ))
+            step = next(
+                button for button in harness.runtime_debug_dialog.findChildren(
+                    QPushButton
+                ) if button.text() == "单步"
+            )
+            self.assertTrue(_wait_until_events(self.app, step.isEnabled))
+            step.click()
+            self.assertFalse(task.run_event.is_set())
+            self.assertTrue(any(
+                title.startswith("调试单步 · 请切回目标程序")
+                for title, _detail, _accent in harness.activity_overlay.messages
+            ))
+            self.assertTrue(_wait_until_events(
+                self.app,
+                lambda: (task.debug_pause_info or {}).get("action_id") == "second",
+            ))
+            self.assertEqual(sent, [("A", "Press"), ("A", "Release")])
+        finally:
+            task.stop()
+            task.wait_for_exit(timeout=1.0)
+            harness.runtime_debug_dialog.close()
+            self.app.processEvents()
+
+    def test_delayed_continue_keeps_task_paused_until_target_is_ready(self):
+        harness = _RuntimeDialogHarness()
+        harness._runtime_debug_resume_target_ready = lambda _task: (
+            False, "请先切回需要测试的程序",
+        )
+        harness.open_runtime_debugger()
+        sent = []
+
+        def send(action, phase, **_kwargs):
+            sent.append((action.get("target"), phase))
+            return True
+
+        task = MacroTask(
+            _preset("root", [{
+                "action_id": "first", "type": "键盘点击",
+                "target": "A", "hold_ms": 1,
+            }]),
+            _Engine(), _Signals(), send_output=send,
+            is_active=lambda: True,
+            debug_state=harness.macro_controller._debug_snapshot,
+        )
+        harness.macro_controller.tasks["root"] = task
+        task.start()
+        try:
+            self.assertTrue(_wait_until_events(
+                self.app, lambda: bool(task.debug_pause_info)
+            ))
+            resume = next(
+                button for button in harness.runtime_debug_dialog.findChildren(
+                    QPushButton
+                ) if button.text() == "继续"
+            )
+            self.assertTrue(_wait_until_events(self.app, resume.isEnabled))
+            resume.click()
+            self.assertTrue(_wait_until_events(
+                self.app,
+                lambda: any(
+                    title == "调试命令未执行"
+                    for title, _detail, _accent in harness.activity_overlay.messages
+                ),
+            ))
+            self.assertFalse(task.run_event.is_set())
+            self.assertEqual(sent, [])
+
+            harness._runtime_debug_resume_target_ready = lambda _task: (True, "")
+            self.assertTrue(_wait_until_events(self.app, resume.isEnabled))
+            resume.click()
+            self.assertTrue(_wait_until_events(
+                self.app, lambda: not task.thread.is_alive()
+            ))
+            self.assertEqual(sent, [("A", "Press"), ("A", "Release")])
+        finally:
+            task.stop()
+            task.wait_for_exit(timeout=1.0)
+            harness.runtime_debug_dialog.close()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

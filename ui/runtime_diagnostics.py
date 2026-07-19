@@ -37,6 +37,7 @@ from core.constants import (
     KANATA_KEYBOARD_LOG_PATH,
     KANATA_LOG_PATH,
 )
+from engine.window_context import foreground_window_belongs_to_current_process
 from macro.actions import iter_action_tree
 from ui.diagnostic_bundle import write_diagnostic_bundle
 from ui.operation_state import operation_blocks, operation_state_snapshot
@@ -44,6 +45,25 @@ from ui.operation_state import operation_blocks, operation_state_snapshot
 
 class RuntimeDiagnosticsMixin:
     """Provide diagnostic controls without owning application runtime state."""
+
+    def _show_runtime_debug_notice(self, title, detail="", accent="#38bdf8"):
+        """Show debugger reminders in the non-activating status overlay."""
+        overlay = getattr(self, "activity_overlay", None)
+        if overlay is None or getattr(self, "recording_session_active", False):
+            return None
+        return overlay.show_message(title, detail, accent)
+
+    def _runtime_debug_resume_target_ready(self, task):
+        """Do not resume debugger output while MacroCanvas owns the foreground."""
+        if foreground_window_belongs_to_current_process():
+            return False, "请先切回需要测试的程序"
+        required_profile = str(task.preset.get("_required_profile_id") or "")
+        profile_active = getattr(task, "profile_active", None)
+        if required_profile and callable(profile_active) and not profile_active(
+            required_profile
+        ):
+            return False, "目标程序尚未恢复为当前配置档案"
+        return True, ""
 
     def update_diagnostic_action_text(self):
         if not hasattr(self, "diagnostic_action"):
@@ -402,7 +422,27 @@ class RuntimeDiagnosticsMixin:
         layout.addLayout(controls)
         timer = QTimer(dialog)
         timer.setInterval(200)
+        command_timer = QTimer(dialog)
+        command_timer.setInterval(100)
         rendered_ids = []
+        pending_command = {}
+
+        def show_notice(title, detail="", accent="#38bdf8"):
+            return self._show_runtime_debug_notice(title, detail, accent)
+
+        def cancel_pending_command(notice=""):
+            if not pending_command:
+                return False
+            command_timer.stop()
+            generation = pending_command.get("overlay_generation")
+            pending_command.clear()
+            if notice:
+                show_notice("调试倒计时已取消", notice, "#fbbf24")
+            elif generation is not None:
+                overlay = getattr(self, "activity_overlay", None)
+                if overlay is not None:
+                    overlay.hide_message(generation)
+            return True
 
         def append_event(item):
             row = table.rowCount()
@@ -493,12 +533,15 @@ class RuntimeDiagnosticsMixin:
             debug_paused = bool(
                 task is not None and debug_pause and not task.run_event.is_set()
             )
-            pause_next.setEnabled(bool(task and task.run_event.is_set()))
-            step.setEnabled(debug_paused)
-            resume.setEnabled(debug_paused)
+            command_pending = bool(pending_command)
+            pause_next.setEnabled(
+                bool(task and task.run_event.is_set() and not command_pending)
+            )
+            step.setEnabled(debug_paused and not command_pending)
+            resume.setEnabled(debug_paused and not command_pending)
             locate.setEnabled(bool(
                 (debug_pause or getattr(self, "runtime_debug_current_action", {}))
-            ))
+            ) and not command_pending)
             held = self.held_input_snapshot()
             backend = "Interception" if self._runtime_is_game_mode() else "Kanata"
             status.setText(
@@ -528,6 +571,7 @@ class RuntimeDiagnosticsMixin:
 
         def finished(_result=0):
             timer.stop()
+            cancel_pending_command()
             self.runtime_debug_enabled = False
             self.runtime_debug_dialog = None
             self.macro_controller.set_debug_enabled(False)
@@ -536,16 +580,104 @@ class RuntimeDiagnosticsMixin:
             return str(task_picker.currentData() or "")
 
         def pause_at_next_action():
-            self.macro_controller.debug_pause_next_action(selected_task_id())
+            task_id = selected_task_id()
+            if self.macro_controller.debug_pause_next_action(task_id):
+                show_notice(
+                    "下一动作将暂停",
+                    "请切回需要测试的程序；宏会在下一动作前暂停。",
+                    "#fbbf24",
+                )
+            else:
+                show_notice(
+                    "未设置暂停", "当前没有可运行的调试任务。", "#fb7185"
+                )
+            refresh()
+
+        def schedule_resume(command):
+            if pending_command:
+                return False
+            task_id = selected_task_id()
+            with self.macro_controller.lock:
+                task = self.macro_controller.tasks.get(task_id)
+            if task is None or task.run_event.is_set() or not task.debug_pause_info:
+                show_notice(
+                    "调试命令未执行", "请先选择一个命中断点且已暂停的宏。", "#fb7185"
+                )
+                refresh()
+                return False
+            delay_seconds = max(
+                0.0, float(getattr(self, "runtime_debug_resume_delay_seconds", 5.0))
+            )
+            command_name = "单步" if command == "step" else "继续"
+            pending_command.update({
+                "command": command,
+                "task_id": task_id,
+                "deadline": time.monotonic() + delay_seconds,
+                "command_name": command_name,
+                "overlay_generation": show_notice(
+                    f"调试{command_name} · 请切回目标程序",
+                    f"将在 {max(1, int(delay_seconds + 0.999))} 秒后执行。",
+                    "#fbbf24",
+                ),
+            })
+            command_timer.start()
+            refresh()
+            return True
+
+        def run_pending_command():
+            if not pending_command:
+                command_timer.stop()
+                return
+            remaining = float(pending_command["deadline"]) - time.monotonic()
+            if remaining > 0:
+                show_notice(
+                    f"调试{pending_command['command_name']} · 请切回目标程序",
+                    f"将在 {max(1, int(remaining + 0.999))} 秒后执行。",
+                    "#fbbf24",
+                )
+                return
+            command_timer.stop()
+            task_id = str(pending_command["task_id"])
+            command = str(pending_command["command"])
+            command_name = str(pending_command["command_name"])
+            with self.macro_controller.lock:
+                task = self.macro_controller.tasks.get(task_id)
+            if task is None or task.run_event.is_set() or not task.debug_pause_info:
+                pending_command.clear()
+                show_notice(
+                    "调试命令未执行", "宏已结束或不再处于调试暂停状态。", "#fb7185"
+                )
+                refresh()
+                return
+            target_ready, reason = self._runtime_debug_resume_target_ready(task)
+            if not target_ready:
+                pending_command.clear()
+                show_notice("调试命令未执行", reason, "#fb7185")
+                refresh()
+                return
+            pending_command.clear()
+            success = (
+                self.macro_controller.debug_step(task_id)
+                if command == "step"
+                else self.macro_controller.debug_continue(task_id)
+            )
+            if success:
+                show_notice(
+                    f"调试{command_name}已执行",
+                    "已向目标程序恢复宏动作。",
+                    "#71efa0",
+                )
+            else:
+                show_notice(
+                    "调试命令未执行", "宏状态已变化，请重新确认断点。", "#fb7185"
+                )
             refresh()
 
         def step_once():
-            self.macro_controller.debug_step(selected_task_id())
-            refresh()
+            schedule_resume("step")
 
         def continue_run():
-            self.macro_controller.debug_continue(selected_task_id())
-            refresh()
+            schedule_resume("continue")
 
         def locate_action():
             with self.macro_controller.lock:
@@ -563,6 +695,7 @@ class RuntimeDiagnosticsMixin:
         close.clicked.connect(dialog.close)
         dialog.finished.connect(finished)
         timer.timeout.connect(refresh)
+        command_timer.timeout.connect(run_pending_command)
         self.runtime_debug_enabled = True
         self.runtime_debug_dialog = dialog
         self.macro_controller.set_debug_breakpoints(
