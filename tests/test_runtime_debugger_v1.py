@@ -3,8 +3,9 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QLabel, QLineEdit, QPushButton,
+    QAbstractItemView, QApplication, QDialog, QLabel, QLineEdit, QPushButton,
 )
 
 from macro.scheduler import MacroController, MacroTask
@@ -572,6 +573,59 @@ class RuntimeDebuggerQtTests(unittest.TestCase):
         self.assertTrue(harness._prune_runtime_debug_breakpoints(card))
         self.assertEqual(harness.runtime_debug_breakpoints, set())
         self.assertEqual(harness.runtime_debug_current_action, {})
+
+    def test_loop_card_keeps_user_selected_position_after_drag_and_arrow_move(self):
+        harness = _BreakpointHarness()
+        table = ActionTreeWidget()
+        table.setColumnCount(5)
+        card = SimpleNamespace(
+            preset_id="root",
+            name=QLineEdit("root"),
+            parameter_definitions=[],
+            action_dialog=QDialog(),
+            action_table=table,
+            action_title=QLabel(),
+            loop_points_button=QPushButton(),
+            _actions_loaded=True,
+            _pending_actions=[],
+        )
+        harness.preset_cards.append(card)
+        harness.select_preset_card(card)
+        actions = [
+            {"action_id": "first", "type": "等待", "wait_ms": 5},
+            {
+                "action_id": "loop", "type": "循环动作", "name": "循环项目 1",
+                "target_action_ids": ["first"], "loop_count": 2,
+            },
+            {"action_id": "last", "type": "等待", "wait_ms": 10},
+        ]
+        self.assertTrue(harness.load_actions(actions, card))
+        loop_item = table.topLevelItem(1)
+        self.assertTrue(loop_item.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+
+        table.setCurrentItem(loop_item)
+        harness.move_action(1, card)
+        self.assertEqual(
+            [action.get("action_id", "loop") for action in harness.collect_visible_actions(card)],
+            ["first", "last", "loop"],
+        )
+
+        loop_item = table.topLevelItem(2)
+        first_item = table.topLevelItem(0)
+        harness.handle_action_drop(
+            card, loop_item, first_item,
+            QAbstractItemView.DropIndicatorPosition.AboveItem,
+        )
+        self.assertEqual(
+            [action.get("action_id", "loop") for action in harness.collect_visible_actions(card)],
+            ["loop", "first", "last"],
+        )
+        saved_actions = harness.collect_visible_actions(card)
+        self.assertTrue(harness.load_actions(saved_actions, card))
+        self.assertEqual(
+            [action.get("action_id", "loop") for action in harness.collect_visible_actions(card)],
+            ["loop", "first", "last"],
+        )
 
     def test_dialog_enables_debugging_and_disables_it_when_closed(self):
         harness = _RuntimeDialogHarness()

@@ -303,7 +303,7 @@ class PresetEditorMixin:
         card.loop_points_button = QPushButton("插入循环点位")
         card.loop_points_button.setObjectName("loopActionButton")
         card.loop_points_button.setToolTip(
-            "依次选择同一层级的开始动作和结束动作；循环卡片会添加到方案最下方，不移动原动作"
+            "依次选择同一层级的开始动作和结束动作；循环卡片会先添加到方案最下方，之后可拖拽或用上下按钮调整位置，不移动原动作"
         )
         card.loop_points_button.clicked.connect(
             lambda _checked=False, c=card: self.loop_points_button_clicked(c)
@@ -447,7 +447,7 @@ class PresetEditorMixin:
             "拖到可视范围边缘会自动滚动，也可在拖动时使用滚轮。“等待”会推迟同层后续动作。"
             "时间型动作可设置随机 ± 浮动，每次执行都会重新取值。"
             "“整理动作”可压缩同层级的密集鼠标轨迹和连续滚轮，并保留循环引用目标。"
-            "“插入循环点位”会在方案最下方添加一个独立循环卡片，引用所选范围但不移动原动作。"
+            "“插入循环点位”会先在方案最下方添加一个独立循环卡片，引用所选范围但不移动原动作；之后可拖拽或用上下按钮调整位置。"
             "“条件”只在满足时执行其子动作；“等条件”超时会结束当前宏。"
             "条件动作下的“条件成立”和“否则”是固定分支；"
             "选中分支后使用上方按钮添加动作，也可在两个分支间拖动普通动作。"

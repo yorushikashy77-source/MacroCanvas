@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
-    QTableWidgetItem, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from config.schema import (
@@ -32,7 +32,7 @@ from macro.recording import simplify_recorded_actions
 from macro.parameters import (
     ACTION_PARAMETER_FIELDS, FIELD_LABELS, MAX_PRESET_PARAMETERS,
     PARAMETER_DURATION, PARAMETER_INPUT, PARAMETER_TYPES,
-    coerce_parameter_value, value_matches_action_field,
+    coerce_parameter_value, resolve_action_parameters, value_matches_action_field,
 )
 from ui.editors import (
     ActionDurationEditor, ActionTargetEditor, ActionTreeWidget, HotkeyEdit,
@@ -476,6 +476,63 @@ class EditorWorkflowMixin:
         self._update_action_variable_marker(item, card)
         self.action_changed(card)
 
+    @staticmethod
+    def _submacro_parameter_usage_details(actions):
+        """Describe every action field that is driven by a child parameter."""
+        usages = {}
+        for target_action in iter_action_tree(actions or []):
+            action_specs = ACTION_PARAMETER_FIELDS.get(
+                target_action.get("type"), {}
+            )
+            for field, parameter_name in (
+                target_action.get("parameter_bindings", {}) or {}
+            ).items():
+                spec = action_specs.get(field)
+                if spec is None:
+                    continue
+                usages.setdefault(str(parameter_name), []).append({
+                    "action_type": str(target_action.get("type") or "动作"),
+                    "field": str(field),
+                    "original_value": target_action.get(field),
+                    "spec": spec,
+                })
+        return usages
+
+    @staticmethod
+    def _format_parameter_preview_value(kind, value):
+        if kind == PARAMETER_DURATION:
+            return f"{value} ms"
+        return str(value)
+
+    @staticmethod
+    def _submacro_preview_action_details(action, preset_names):
+        """Return concise, resolved action text for the child-call preview."""
+        action_type = str(action.get("type") or "动作")
+        if action_type in ("键盘点击", "鼠标点击"):
+            return (
+                action_type,
+                f"{action.get('target', '—')} · 按住 {action.get('hold_ms', 0)} ms",
+            )
+        if action_type == "等待":
+            return action_type, f"{action.get('wait_ms', 0)} ms"
+        if action_type == "鼠标滚轮":
+            return action_type, f"{action.get('target', '—')} · {action.get('steps', 0)} 格"
+        if action_type in (CONDITION_ACTION_TYPE, WAIT_CONDITION_ACTION_TYPE):
+            detail = f"{action.get('condition_input', '—')} · {action.get('condition_state', '按住时')}"
+            if action_type == WAIT_CONDITION_ACTION_TYPE:
+                detail += f" · 超时 {action.get('timeout_ms', 0)} ms"
+            return action_type, detail
+        if action_type == SUBMACRO_ACTION_TYPE:
+            target_id = str(action.get("preset_id") or "")
+            name = preset_names.get(target_id, target_id or "未选择")
+            return action_type, (
+                f"{name} · {action.get('repeat_count', 1)} 次 · "
+                f"{action.get('speed_percent', 100)} %"
+            )
+        if action_type == LOOP_ACTION_TYPE:
+            return action_type, str(action.get("name") or "循环项目")
+        return action_type, ""
+
     def _edit_submacro_parameter_values(self, card, item, action):
         target_id = str(action.get("preset_id") or "")
         target_card = next(
@@ -491,22 +548,22 @@ class EditorWorkflowMixin:
             return
         dialog = QDialog(card.action_dialog)
         dialog.setWindowTitle("设置子宏变量")
-        form = QFormLayout(dialog)
+        dialog.resize(760, 620)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "覆盖值只影响当前这一次子宏调用。下方会列出变量影响的动作，"
+            "并预览本次调用的实际动作值。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+        form = QFormLayout()
+        layout.addLayout(form)
         current = dict(item.data(0, ACTION_PARAMETER_VALUES_ROLE) or {})
-        usages = {}
         target_actions = (
             self.collect_visible_actions(target_card) if target_card is not None else []
         )
-        for target_action in iter_action_tree(target_actions):
-            action_specs = ACTION_PARAMETER_FIELDS.get(
-                target_action.get("type"), {}
-            )
-            for field, parameter_name in (
-                target_action.get("parameter_bindings", {}) or {}
-            ).items():
-                spec = action_specs.get(field)
-                if spec is not None:
-                    usages.setdefault(str(parameter_name), []).append(spec)
+        usages = self._submacro_parameter_usage_details(target_actions)
         controls = {}
         for definition in definitions:
             name = definition["name"]
@@ -518,7 +575,8 @@ class EditorWorkflowMixin:
             if definition["type"] == PARAMETER_INPUT:
                 editor = QComboBox()
                 allowed = set(INPUT_NAMES)
-                for _kind, _minimum, _maximum, choices in usages.get(name, []):
+                for usage in usages.get(name, []):
+                    _kind, _minimum, _maximum, choices = usage["spec"]
                     if choices is not None:
                         allowed.intersection_update(choices)
                 editor.addItems([value for value in INPUT_NAMES if value in allowed])
@@ -529,7 +587,8 @@ class EditorWorkflowMixin:
                 maximum = (
                     600_000 if definition["type"] == PARAMETER_DURATION else 100_000
                 )
-                for _kind, field_minimum, field_maximum, _choices in usages.get(name, []):
+                for usage in usages.get(name, []):
+                    _kind, field_minimum, field_maximum, _choices = usage["spec"]
                     if field_minimum is not None:
                         minimum = max(minimum, field_minimum)
                     if field_maximum is not None:
@@ -542,22 +601,125 @@ class EditorWorkflowMixin:
             row_layout.addWidget(enabled)
             row_layout.addWidget(editor, 1)
             form.addRow(f"{name}（{definition['type']}）", row)
-            controls[name] = (enabled, editor, definition)
+            impact = QLabel()
+            impact.setWordWrap(True)
+            impact.setObjectName("muted")
+            form.addRow("", impact)
+            controls[name] = (enabled, editor, definition, impact)
+
+        preview_title = QLabel("本次调用执行流程预览")
+        preview_title.setObjectName("sectionLabel")
+        layout.addWidget(preview_title)
+        preview = QTreeWidget()
+        preview.setColumnCount(3)
+        preview.setHeaderLabels(["动作", "本次实际值", "变量来源"])
+        preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        preview.setRootIsDecorated(True)
+        preview.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        preview.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        preview.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layout.addWidget(preview, 1)
+
+        preset_names = {
+            str(other.preset_id): other.name.text().strip() or "未命名预设"
+            for other in self.preset_cards
+        }
+        definitions_by_name = {
+            definition["name"]: definition for definition in definitions
+        }
+
+        def current_overrides():
+            values = {}
+            for name, (enabled, editor, definition, _impact) in controls.items():
+                if not enabled.isChecked():
+                    continue
+                raw = (
+                    editor.currentText()
+                    if isinstance(editor, QComboBox) else editor.value()
+                )
+                values[name] = coerce_parameter_value(definition["type"], raw)
+            return values
+
+        def refresh_reference_details(*_args):
+            overrides = current_overrides()
+            resolved_values = {
+                definition["name"]: overrides.get(
+                    definition["name"], definition["default"]
+                )
+                for definition in definitions
+            }
+            for name, (_enabled, _editor, definition, impact) in controls.items():
+                details = []
+                for usage in usages.get(name, []):
+                    final_value = self._format_parameter_preview_value(
+                        definition["type"], resolved_values[name]
+                    )
+                    original_value = self._format_parameter_preview_value(
+                        definition["type"], usage["original_value"]
+                    )
+                    details.append(
+                        f"{usage['action_type']} → "
+                        f"{FIELD_LABELS.get(usage['field'], usage['field'])}"
+                        f"（原 {original_value} → 本次 {final_value}）"
+                    )
+                impact.setText(
+                    "影响：" + "；".join(details)
+                    if details else "当前没有动作引用此变量，覆盖后不会改变执行结果。"
+                )
+
+            resolved_actions = resolve_action_parameters(
+                target_actions, {"parameters": definitions}, overrides
+            )
+            preview.clear()
+
+            def add_preview_actions(actions, parent=None):
+                for preview_action in actions or []:
+                    action_type, detail = self._submacro_preview_action_details(
+                        preview_action, preset_names
+                    )
+                    sources = []
+                    for field, name in (
+                        preview_action.get("parameter_bindings", {}) or {}
+                    ).items():
+                        definition = definitions_by_name.get(name)
+                        if definition is not None and name in resolved_values:
+                            value_text = self._format_parameter_preview_value(
+                                definition["type"], resolved_values[name]
+                            )
+                            sources.append(
+                                f"{name}={value_text}"
+                            )
+                    row = QTreeWidgetItem([action_type, detail, "；".join(sources)])
+                    if parent is None:
+                        preview.addTopLevelItem(row)
+                    else:
+                        parent.addChild(row)
+                    add_preview_actions(preview_action.get("children", []), row)
+
+            add_preview_actions(resolved_actions)
+            preview.expandAll()
+
+        for enabled, editor, _definition, _impact in controls.values():
+            enabled.toggled.connect(refresh_reference_details)
+            if isinstance(editor, QComboBox):
+                editor.currentTextChanged.connect(refresh_reference_details)
+            else:
+                editor.valueChanged.connect(refresh_reference_details)
+        refresh_reference_details()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = {}
-        for name, (enabled, editor, definition) in controls.items():
-            if not enabled.isChecked():
-                continue
-            raw = editor.currentText() if isinstance(editor, QComboBox) else editor.value()
-            values[name] = coerce_parameter_value(definition["type"], raw)
+        for name, (enabled, editor, definition, _impact) in controls.items():
+            if enabled.isChecked():
+                raw = editor.currentText() if isinstance(editor, QComboBox) else editor.value()
+                values[name] = coerce_parameter_value(definition["type"], raw)
         item.setData(0, ACTION_PARAMETER_VALUES_ROLE, values)
         self._update_action_variable_marker(item, card)
         self.action_changed(card)
@@ -912,7 +1074,7 @@ class EditorWorkflowMixin:
             button.setText("插入循环点位")
             button.setObjectName("loopActionButton")
             button.setToolTip(
-                "依次选择同一层级的开始动作和结束动作；循环卡片会添加到方案最下方，不移动原动作"
+                "依次选择同一层级的开始动作和结束动作；循环卡片会先添加到方案末尾，之后可调整位置，不移动原动作"
             )
         elif stage == 1:
             button.setText("选择开始点…")
@@ -925,7 +1087,9 @@ class EditorWorkflowMixin:
         else:
             button.setText("添加循环动作")
             button.setObjectName("loopActionReady")
-            button.setToolTip("在方案最下方添加一个引用该范围的循环卡片；原动作保持原位")
+            button.setToolTip(
+                "先在方案最下方添加一个引用该范围的循环卡片；原动作保持原位，之后可调整卡片位置"
+            )
         self._repolish_widget(button)
 
     def reset_loop_point_selection(self, card):
@@ -1098,8 +1262,8 @@ class EditorWorkflowMixin:
             "color_index": (sequence_number - 1) % len(LOOP_COLOR_THEMES),
             "children": [],
         }
-        # The loop card is a separate control item at the very end of the preset.
-        # It only references the selected actions and never removes or reparents them.
+        # The loop card is a separate control item. It only references the selected
+        # actions and never removes or reparents them.
         actions.append(loop_action)
         new_path = (len(actions) - 1,)
         self.reset_loop_point_selection(card)
@@ -1114,10 +1278,8 @@ class EditorWorkflowMixin:
         self.action_changed(card)
 
     def handle_action_drop(self, card, source_item, target_item, position):
-        """Move ordinary actions without allowing loop cards to own or reorder them."""
+        """Move actions while keeping loop cards as top-level control items."""
         if card not in self.preset_cards or source_item is None:
-            return
-        if self.is_loop_action_item(source_item):
             return
         if self.is_condition_branch_item(source_item):
             return
@@ -1137,6 +1299,42 @@ class EditorWorkflowMixin:
         target_action = self._action_at_path(actions, target_path)
         if source_action is None or source_action is target_action:
             return
+        source_is_loop = self.is_loop_action_item(source_item)
+        if source_is_loop:
+            # Loop cards are independent control rows. They may be reordered with
+            # other top-level rows, but cannot become a child of an action or branch.
+            if len(source_path) != 1:
+                return
+            if target_item is not None and (
+                target_item.parent() is not None or target_path is None
+            ):
+                return
+            source_parent = self._action_parent_list(actions, source_path)
+            if source_parent is None:
+                return
+            source_parent.pop(source_path[-1])
+            if (
+                target_action is None
+                or position == QAbstractItemView.DropIndicatorPosition.OnViewport
+            ):
+                insert_at = len(actions)
+            else:
+                target_index = actions.index(target_action)
+                insert_at = target_index + (
+                    0 if position == QAbstractItemView.DropIndicatorPosition.AboveItem
+                    else 1
+                )
+            actions.insert(insert_at, source_action)
+            self.load_actions(actions, card)
+            selected = self._item_at_path(card.action_table, (insert_at,))
+            if selected is not None:
+                card.action_table.setCurrentItem(selected)
+                selected.setSelected(True)
+                card.action_table.scrollToItem(
+                    selected, QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+            self.action_changed(card)
+            return
         source_parent = self._action_parent_list(actions, source_path)
         if source_parent is None:
             return
@@ -1147,22 +1345,19 @@ class EditorWorkflowMixin:
         below_item = QAbstractItemView.DropIndicatorPosition.BelowItem
         on_viewport = QAbstractItemView.DropIndicatorPosition.OnViewport
 
-        # Loop cards are fixed control rows at the end. Dropping on one places the
-        # ordinary action immediately before the first loop card, never inside it.
-        first_loop_index = next(
-            (i for i, action in enumerate(actions)
-             if action.get("type") == LOOP_ACTION_TYPE),
-            len(actions),
-        )
         new_path = None
         target_path = self._find_action_path(actions, target_action)
         target_type = target_action.get("type") if target_action else ""
         if target_action is not None and target_type == LOOP_ACTION_TYPE:
-            actions.insert(first_loop_index, source_action)
-            new_path = (first_loop_index,)
+            target_index = actions.index(target_action)
+            insert_at = target_index + (
+                0 if position == above_item else 1
+            )
+            actions.insert(insert_at, source_action)
+            new_path = (insert_at,)
         elif position == on_viewport or target_action is None or target_path is None:
-            actions.insert(first_loop_index, source_action)
-            new_path = (first_loop_index,)
+            actions.append(source_action)
+            new_path = (len(actions) - 1,)
         elif target_type == CONDITION_ACTION_TYPE and position == on_item:
             branches = target_action.get("children", []) or []
             true_branch = next(
@@ -1191,8 +1386,8 @@ class EditorWorkflowMixin:
         elif position in (above_item, below_item):
             target_parent = self._action_parent_list(actions, target_path)
             if target_parent is None:
-                actions.insert(first_loop_index, source_action)
-                new_path = (first_loop_index,)
+                actions.append(source_action)
+                new_path = (len(actions) - 1,)
             else:
                 insert_at = target_path[-1]
                 if position == below_item:
@@ -1200,8 +1395,8 @@ class EditorWorkflowMixin:
                 target_parent.insert(insert_at, source_action)
                 new_path = target_path[:-1] + (insert_at,)
         else:
-            actions.insert(first_loop_index, source_action)
-            new_path = (first_loop_index,)
+            actions.append(source_action)
+            new_path = (len(actions) - 1,)
 
         self.load_actions(actions, card)
         selected = self._item_at_path(card.action_table, new_path)
@@ -1439,9 +1634,7 @@ class EditorWorkflowMixin:
         index = table.indexOfTopLevelItem(current)
         if index < 0:
             return None, None
-        # 循环卡片固定在预设末尾。若当前选中循环卡片，普通动作放到
-        # 该循环卡片前方，避免破坏“循环项目始终在末尾”的旧语义。
-        return None, index if self.is_loop_action_item(current) else index + 1
+        return None, index + 1
 
     def add_action_from_menu(self, action=None, card=None):
         card = card or self.selected_preset_card
@@ -1477,17 +1670,10 @@ class EditorWorkflowMixin:
         is_condition_branch = action.get("type") in CONDITION_BRANCH_TYPES
         if is_loop:
             parent_item = None
-            insert_index = None
-        elif parent_item is None:
-            first_loop_index = next(
-                (index for index in range(table.topLevelItemCount())
-                 if self.is_loop_action_item(table.topLevelItem(index))),
-                table.topLevelItemCount(),
-            )
-            if insert_index is None or insert_index > first_loop_index:
-                insert_index = first_loop_index
         if is_loop:
-            item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item.setFlags(
+                Qt.ItemIsDragEnabled | Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            )
         elif is_condition_branch:
             item.setFlags(
                 Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
@@ -1531,7 +1717,7 @@ class EditorWorkflowMixin:
         )
         item.setToolTip(
             0,
-            "循环卡片固定在方案末尾" if is_loop
+            "独立循环卡片：按住此处拖拽或使用上下按钮调整位置；不能成为子动作" if is_loop
             else "分支容器固定在条件动作下" if is_condition_branch
             else "按住此处拖拽，可改变顺序或层级",
         )
@@ -1882,10 +2068,12 @@ class EditorWorkflowMixin:
         self.select_preset_card(card)
         table = card.action_table
         item = table.currentItem()
-        if self.is_loop_action_item(item) or self.is_condition_branch_item(item):
+        if self.is_condition_branch_item(item):
             return
         path = self._action_item_path(table, item)
         if not path:
+            return
+        if self.is_loop_action_item(item) and len(path) != 1:
             return
         actions = self.collect_visible_actions(card)
         siblings = self._action_parent_list(actions, path)
@@ -2553,7 +2741,10 @@ class EditorWorkflowMixin:
                 if str(action_id) in valid_ids
             ]
             loop["children"] = []
-        return ordinary + loops
+        # Loop controls do not change runtime timeline order, but their visual
+        # placement is intentionally user-controlled.  Preserve the tree order
+        # so dragging or using the up/down buttons is not undone on every save.
+        return actions
 
     def synchronize_loop_references(self, card):
         """Repair loop references immediately after action-tree edits.

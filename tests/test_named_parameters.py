@@ -6,6 +6,7 @@ from macro.parameters import resolve_action_parameters
 from macro.scheduler import MacroTask
 from macro.simulation import simulate_preset
 from ui.input_runtime import InputRuntimeMixin
+from ui.editor_workflow import EditorWorkflowMixin
 from ui.main_window import MainWindow
 
 
@@ -47,6 +48,36 @@ def _preset(preset_id, actions, parameters=None):
 
 
 class NamedParameterSchemaTests(unittest.TestCase):
+    def test_submacro_variable_usage_identifies_affected_action_fields(self):
+        usages = EditorWorkflowMixin._submacro_parameter_usage_details([
+            {
+                "action_id": "key", "type": "键盘点击", "target": "A",
+                "hold_ms": 20,
+                "parameter_bindings": {
+                    "target": "技能键", "hold_ms": "按住时长",
+                },
+            },
+            {
+                "action_id": "wait", "type": "等待", "wait_ms": 40,
+                "parameter_bindings": {"wait_ms": "等待时长"},
+            },
+        ])
+        self.assertEqual(
+            [(item["action_type"], item["field"], item["original_value"])
+            for item in usages["技能键"]],
+            [("键盘点击", "target", "A")],
+        )
+        self.assertEqual(
+            [(item["action_type"], item["field"], item["original_value"])
+            for item in usages["按住时长"]],
+            [("键盘点击", "hold_ms", 20)],
+        )
+        self.assertEqual(
+            [(item["action_type"], item["field"], item["original_value"])
+            for item in usages["等待时长"]],
+            [("等待", "wait_ms", 40)],
+        )
+
     def test_old_presets_without_parameters_remain_valid(self):
         payload = {"presets": [_preset("root", [
             {"action_id": "a", "type": "等待", "wait_ms": 10},
