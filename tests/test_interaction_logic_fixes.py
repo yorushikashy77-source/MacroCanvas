@@ -275,6 +275,7 @@ class InteractionLogicFixTests(unittest.TestCase):
             last_action_context={
                 "action": "等待条件 Space", "source_preset_id": "child",
                 "action_id": "wait-space",
+                "call_chain_ids": ["preset-a", "child"],
             },
         )
         failure = harness._record_macro_run_history(failed)
@@ -282,6 +283,7 @@ class InteractionLogicFixTests(unittest.TestCase):
         self.assertEqual(failure["failure_action_type"], "")
         self.assertEqual(failure["action_preset_id"], "child")
         self.assertEqual(failure["action_id"], "wait-space")
+        self.assertEqual(failure["call_chain_ids"], ["preset-a", "child"])
 
         mapping = SimpleNamespace(
             preset={"id": "mapping:basic", "name": "基础映射"},

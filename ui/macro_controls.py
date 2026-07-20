@@ -73,6 +73,9 @@ class MacroControlsMixin:
                 action_context.get("source_preset_id") or origin_id
             ),
             "action_id": str(action_context.get("action_id") or ""),
+            "call_chain_ids": list(
+                action_context.get("call_chain_ids", []) or []
+            ),
         }
         history = list(getattr(self, "macro_run_history", []) or [])
         history.insert(0, entry)

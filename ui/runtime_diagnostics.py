@@ -363,6 +363,7 @@ class RuntimeDiagnosticsMixin:
             "failure_action_recorded": bool(entry.get("failure_action")),
             "failure_action_location_recorded": bool(entry.get("action_id")),
         }
+        failure_context["action_locator"] = self._failed_run_action_locator(entry)
         health_context = {
             "issue_count": len(health_issues),
             "issue_categories": dict(sorted(categories.items())),
@@ -406,6 +407,56 @@ class RuntimeDiagnosticsMixin:
             f"包含 {len(included)} 份可用日志、失败摘要和方案检查结果；原始配置未写入压缩包。",
         )
         return True
+
+    def _failed_run_action_locator(self, entry):
+        """Return a share-safe structural locator for one failed action."""
+        entry = dict(entry or {})
+        action_id = str(entry.get("action_id") or "")
+        owner_id = str(entry.get("action_preset_id") or "")
+        locator = {
+            "available": bool(action_id),
+            "action_id": action_id,
+            "owner_token": owner_id,
+            "call_chain_tokens": [
+                str(value) for value in entry.get("call_chain_ids", []) or []
+                if str(value)
+            ],
+            "position": [],
+            "position_label": "",
+        }
+        if not action_id or not owner_id:
+            return locator
+        card = next(
+            (
+                item for item in getattr(self, "preset_cards", [])
+                if str(getattr(item, "preset_id", "") or "") == owner_id
+            ),
+            None,
+        )
+        collector = getattr(self, "collect_visible_actions", None)
+        if card is None or not callable(collector):
+            return locator
+
+        def find_position(actions, prefix=()):
+            for index, action in enumerate(actions or [], 1):
+                position = prefix + (index,)
+                if str(action.get("action_id") or "") == action_id:
+                    return position
+                nested = find_position(action.get("children", []) or [], position)
+                if nested:
+                    return nested
+            return ()
+
+        try:
+            position = find_position(collector(card))
+        except (AttributeError, TypeError, RuntimeError):
+            return locator
+        if position:
+            locator["position"] = list(position)
+            locator["position_label"] = " / ".join(
+                f"动作 {index}" for index in position
+            )
+        return locator
 
     def _runtime_debug_action_item(self, info):
         preset_id = str((info or {}).get("source_preset_id") or "")

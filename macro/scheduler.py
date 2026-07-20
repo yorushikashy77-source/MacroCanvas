@@ -152,6 +152,10 @@ class MacroTask:
         path = list(action.get("_debug_path", []) or [])
         if not path:
             path = [str(self.preset.get("name") or "预设")]
+        call_chain_ids = list(action.get("_debug_call_chain_ids", []) or [])
+        if not call_chain_ids:
+            root_id = str(self.preset.get("id") or "")
+            call_chain_ids = [root_id] if root_id else []
         return {
             "source_preset_id": str(
                 action.get("_debug_preset_id") or self.preset.get("id") or ""
@@ -163,6 +167,7 @@ class MacroTask:
             "action_id": str(action.get("action_id") or ""),
             "action_type": str(action.get("type") or "动作"),
             "path": path,
+            "call_chain_ids": call_chain_ids,
             "parameters": dict(
                 action.get("_debug_parameters", self.root_debug_parameters) or {}
             ),
@@ -1187,6 +1192,7 @@ class MacroTask:
             action["_debug_preset_id"] = str(preset_id or "")
             action["_debug_preset_name"] = str(preset_name or "预设")
             action["_debug_path"] = list(path or [])
+            action["_debug_call_chain_ids"] = list(stack or [])
             action["_debug_parameters"] = dict(parameters or {})
             if action.get("type") == SUBMACRO_ACTION_TYPE:
                 action["_call_stack"] = tuple(stack)

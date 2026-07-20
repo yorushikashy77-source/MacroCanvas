@@ -14,6 +14,7 @@ from macro.simulation import simulate_preset
 from ui.diagnostic_bundle import REDACTED, redact_log_text, write_diagnostic_bundle
 from ui.operation_state import operation_blocks, operation_state_snapshot
 from ui.catalog_tools import CatalogToolsMixin
+from ui.runtime_diagnostics import RuntimeDiagnosticsMixin
 from ui.simulation_preview import SimulationPreviewDialog
 
 
@@ -173,6 +174,26 @@ class CatalogToolTests(unittest.TestCase):
         dialog.close()
 
 
+class _FailedRunLocationHarness(RuntimeDiagnosticsMixin):
+    def __init__(self):
+        self.card = SimpleNamespace(preset_id="child")
+        self.preset_cards = [self.card]
+
+    def collect_visible_actions(self, card):
+        self.assertIs(card, self.card)
+        return [
+            {"action_id": "first", "type": "键盘点击"},
+            {
+                "action_id": "branch", "type": "条件分支",
+                "children": [{"action_id": "wait-space", "type": "等待条件"}],
+            },
+        ]
+
+    def assertIs(self, left, right):
+        if left is not right:
+            raise AssertionError("Unexpected preset card")
+
+
 class DiagnosticBundleTests(unittest.TestCase):
     def test_json_fields_and_paths_are_redacted(self):
         text = json.dumps({
@@ -245,6 +266,21 @@ class DiagnosticBundleTests(unittest.TestCase):
                 self.assertEqual(context["preset_name"], REDACTED)
                 self.assertEqual(context["source"], REDACTED)
                 self.assertEqual(context["failure_action_type"], "等待条件")
+
+    def test_failed_run_locator_keeps_structural_position_without_names(self):
+        harness = _FailedRunLocationHarness()
+        locator = harness._failed_run_action_locator({
+            "action_preset_id": "child",
+            "action_id": "wait-space",
+            "call_chain_ids": ["root", "child"],
+        })
+
+        self.assertTrue(locator["available"])
+        self.assertEqual(locator["action_id"], "wait-space")
+        self.assertEqual(locator["owner_token"], "child")
+        self.assertEqual(locator["call_chain_tokens"], ["root", "child"])
+        self.assertEqual(locator["position"], [2, 1])
+        self.assertEqual(locator["position_label"], "动作 2 / 动作 1")
 
 
 if __name__ == "__main__":
