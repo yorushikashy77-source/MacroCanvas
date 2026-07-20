@@ -106,6 +106,7 @@ class MacroControlsMixin:
     def open_macro_run_history(self):
         dialog = QDialog(self)
         self.macro_run_history_dialog = dialog
+        pending_location = None
         dialog.setWindowTitle("宏运行历史")
         dialog.resize(920, 520)
         layout = QVBoxLayout(dialog)
@@ -171,26 +172,30 @@ class MacroControlsMixin:
         export_failure.clicked.connect(export_selected_failure)
 
         def locate_selected(*_args):
+            nonlocal pending_location
             row = hint.currentItem()
             preset_id = str(row.data(0, 32) or "") if row is not None else ""
             action_id = str(row.data(1, 32) or "") if row is not None else ""
             if not preset_id:
                 return
-            # Let the modal history window finish closing before raising the
-            # action editor; otherwise its modal focus can immediately hide
-            # the newly opened editor on some Windows/Qt combinations.
+            # Keep the target until dialog.exec() has returned.  A zero-delay
+            # timer here can still run in the history dialog's nested event
+            # loop, which lets its close/focus cleanup hide the editor again.
+            pending_location = (preset_id, action_id)
             dialog.accept()
+
+        hint.itemDoubleClicked.connect(locate_selected)
+        layout.addWidget(buttons)
+        dialog.exec()
+        self.macro_run_history_dialog = None
+        if pending_location is not None:
+            preset_id, action_id = pending_location
             QTimer.singleShot(
                 0,
                 lambda: self.locate_macro_run_history_action(
                     preset_id, action_id
                 ),
             )
-
-        hint.itemDoubleClicked.connect(locate_selected)
-        layout.addWidget(buttons)
-        dialog.exec()
-        self.macro_run_history_dialog = None
 
     def _macro_callback_blocked_by_shutdown(self):
         """Keep delayed task callbacks from reopening output during shutdown."""

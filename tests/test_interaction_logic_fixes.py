@@ -5,7 +5,8 @@ from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QTreeWidget, QWidget
 
 from core.constants import ConfigState, MacroState
 from ui.macro_controls import MacroControlsMixin
@@ -144,6 +145,30 @@ class _MacroHistoryLocationHarness(MacroControlsMixin):
         return action_id == "wait-space"
 
 
+class _MacroHistoryDialogHarness(QWidget, MacroControlsMixin):
+    def __init__(self):
+        super().__init__()
+        self.macro_run_history = [{
+            "finished_at": time.time(),
+            "preset_id": "child",
+            "preset_name": "技能连招",
+            "source": "测试方案",
+            "status": "失败",
+            "detail": "等待条件超时",
+            "duration_ms": 100,
+            "failure_action": "等待 Space 按住时",
+            "action_preset_id": "child",
+            "action_id": "wait-space",
+        }]
+        self.location_calls = []
+
+    def locate_macro_run_history_action(self, preset_id, action_id=""):
+        self.location_calls.append((
+            preset_id, action_id, self.macro_run_history_dialog,
+        ))
+        return True
+
+
 class _RecordingHarness(RecordingWorkflowMixin):
     def __init__(self):
         self.recording_restore_pending = False
@@ -275,6 +300,25 @@ class InteractionLogicFixTests(unittest.TestCase):
         self.assertEqual(harness.focused, (harness.target_card, "wait-space"))
         self.assertFalse(
             harness.locate_macro_run_history_action("missing", "wait-space")
+        )
+
+    def test_macro_history_location_waits_for_dialog_to_close(self):
+        harness = _MacroHistoryDialogHarness()
+
+        def double_click_failure():
+            dialog = harness.macro_run_history_dialog
+            tree = dialog.findChild(QTreeWidget, "macroRunHistory")
+            row = tree.topLevelItem(0)
+            tree.setCurrentItem(row)
+            tree.itemDoubleClicked.emit(row, 0)
+
+        QTimer.singleShot(0, double_click_failure)
+        harness.open_macro_run_history()
+        self.app.processEvents()
+
+        self.assertEqual(
+            harness.location_calls,
+            [("child", "wait-space", None)],
         )
 
     def test_finish_hotkey_during_countdown_does_not_cancel(self):
