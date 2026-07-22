@@ -228,6 +228,30 @@ class Phase3RuntimeTests(unittest.TestCase):
         self.assertEqual(sent.count(("C", "Press")), 2)
         self.assertEqual(sent.count(("C", "Release")), 2)
 
+    def test_nested_submacro_timeout_keeps_complete_call_chain(self):
+        child = _preset("child", [{
+            "action_id": "wait-space", "type": "等待条件",
+            "condition_input": "Space", "condition_state": "按住时",
+            "timeout_ms": 10, "poll_ms": 2,
+        }])
+        root = _preset("root", [{
+            "action_id": "call-child", "type": "调用子宏",
+            "preset_id": "child", "repeat_count": 1,
+            "speed_percent": 100,
+        }])
+        library = {"root": root, "child": child}
+        root["_preset_library"] = library
+        child["_preset_library"] = library
+
+        task, _sent = self.make_task(root)
+        self.assertFalse(task.run_action_group(root["actions"][0], 100))
+        self.assertEqual(task.finish_reason, "condition_timeout")
+        self.assertEqual(task.last_action_context["source_preset_id"], "child")
+        self.assertEqual(task.last_action_context["action_id"], "wait-space")
+        self.assertEqual(task.last_action_context["call_chain_ids"], [
+            "root", "child",
+        ])
+
 
 class Phase3SimulationTests(unittest.TestCase):
     def test_submacro_and_condition_ranges_are_conservative(self):
