@@ -282,6 +282,16 @@ class DiagnosticBundleTests(unittest.TestCase):
         self.assertEqual(locator["position"], [2, 1])
         self.assertEqual(locator["position_label"], "动作 2 / 动作 1")
 
+    def test_failed_run_locator_reconstructs_chain_for_older_history_entry(self):
+        harness = _FailedRunLocationHarness()
+        locator = harness._failed_run_action_locator({
+            "preset_id": "root",
+            "action_preset_id": "child",
+            "action_id": "wait-space",
+        })
+
+        self.assertEqual(locator["call_chain_tokens"], ["root", "child"])
+
 
 if __name__ == "__main__":
     unittest.main()

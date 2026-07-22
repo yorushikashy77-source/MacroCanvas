@@ -413,14 +413,23 @@ class RuntimeDiagnosticsMixin:
         entry = dict(entry or {})
         action_id = str(entry.get("action_id") or "")
         owner_id = str(entry.get("action_preset_id") or "")
+        call_chain_tokens = [
+            str(value) for value in entry.get("call_chain_ids", []) or []
+            if str(value)
+        ]
+        if not call_chain_tokens:
+            # Older in-memory history entries predate call-chain capture.
+            # Their root preset plus the action owner still reconstructs the
+            # useful route for direct and one-level child-macro failures.
+            for token in (entry.get("preset_id"), owner_id):
+                token = str(token or "")
+                if token and token not in call_chain_tokens:
+                    call_chain_tokens.append(token)
         locator = {
             "available": bool(action_id),
             "action_id": action_id,
             "owner_token": owner_id,
-            "call_chain_tokens": [
-                str(value) for value in entry.get("call_chain_ids", []) or []
-                if str(value)
-            ],
+            "call_chain_tokens": call_chain_tokens,
             "position": [],
             "position_label": "",
         }
