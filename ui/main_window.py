@@ -419,6 +419,9 @@ class MainWindow(
         self.config_state = ConfigState.SAVED
         self.macro_state = MacroState.IDLE
         self.macro_status_detail = ""
+        self.macro_run_history = []
+        self.macro_run_history_retention_days = 30
+        self.load_persistent_macro_run_history()
         # 缓存最近一次宏动作，用于暂停时同步主界面通知栏和右上角浮窗。
         self.last_action_activity = {}
         self._test_countdown_generation = 0

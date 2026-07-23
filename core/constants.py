@@ -15,6 +15,7 @@ CONFIG_BACKUP_LIMIT = 10
 LEGACY_CONFIG_PATH = APP_DIR / "mappings.json"
 KANATA_SETTINGS_PATH = APP_DIR / "components.json"
 UI_SETTINGS_PATH = APP_DIR / "ui-settings.json"
+MACRO_RUN_HISTORY_PATH = APP_DIR / "macro-run-history.json"
 
 # Official upstream pages for the runtime components used by MacroCanvas.
 KANATA_GITHUB_URL = "https://github.com/jtroo/kanata"

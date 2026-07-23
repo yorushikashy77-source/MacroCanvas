@@ -1,16 +1,20 @@
 """UI-facing macro activity and stop/pause controls."""
 
 import inspect
+import json
 import time
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QHeaderView, QMessageBox, QPushButton,
-    QSystemTrayIcon, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QDialog, QDialogButtonBox, QHeaderView, QHBoxLayout, QLabel,
+    QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout,
 )
 
-from core.constants import MacroState
+from config.storage import atomic_write_text
+from core.constants import MACRO_RUN_HISTORY_PATH, MacroState
 from ui.runtime_guards import (
     explain_runtime_cleanup_block, macro_control_transaction_busy,
     runtime_cleanup_blocks_new_output,
@@ -20,6 +24,125 @@ from ui.runtime_guards import (
 class MacroControlsMixin:
     MACRO_STOP_TIMEOUT_SECONDS = 2.0
     MACRO_RUN_HISTORY_LIMIT = 120
+    MACRO_RUN_HISTORY_PERSISTENT_LIMIT = 50
+    MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT = 30
+    MACRO_RUN_HISTORY_PERSISTENCE_VERSION = 1
+
+    @staticmethod
+    def _persistent_macro_history_entry(entry):
+        """Keep only a failure's non-identifying diagnostic locator fields."""
+        return {
+            "finished_at": float(entry.get("finished_at") or 0),
+            "status": "失败",
+            "detail": str(entry.get("detail") or ""),
+            "duration_ms": max(0, int(entry.get("duration_ms") or 0)),
+            "failure_action_type": str(
+                entry.get("failure_action_type") or ""
+            ),
+            "action_preset_id": str(
+                entry.get("action_preset_id") or ""
+            ),
+            "action_id": str(entry.get("action_id") or ""),
+            "call_chain_ids": [
+                str(value) for value in entry.get("call_chain_ids", []) or []
+                if str(value)
+            ],
+        }
+
+    def _persistent_macro_history_payload(self):
+        retention_days = max(
+            1,
+            min(
+                365,
+                int(getattr(
+                    self,
+                    "macro_run_history_retention_days",
+                    self.MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT,
+                ) or self.MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT),
+            ),
+        )
+        cutoff = time.time() - retention_days * 24 * 60 * 60
+        entries = [
+            self._persistent_macro_history_entry(entry)
+            for entry in getattr(self, "macro_run_history", []) or []
+            if str(entry.get("status") or "") == "失败"
+            and float(entry.get("finished_at") or 0) >= cutoff
+        ]
+        return {
+            "version": self.MACRO_RUN_HISTORY_PERSISTENCE_VERSION,
+            "retention_days": retention_days,
+            "entries": entries[:self.MACRO_RUN_HISTORY_PERSISTENT_LIMIT],
+        }
+
+    def _save_persistent_macro_run_history(self):
+        """Persist a bounded, redacted failure-only summary outside config."""
+        try:
+            Path(MACRO_RUN_HISTORY_PATH).parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                MACRO_RUN_HISTORY_PATH,
+                json.dumps(
+                    self._persistent_macro_history_payload(),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def load_persistent_macro_run_history(self):
+        """Restore safe failure summaries from earlier app launches."""
+        self.macro_run_history = []
+        self.macro_run_history_retention_days = (
+            self.MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT
+        )
+        try:
+            path = Path(MACRO_RUN_HISTORY_PATH)
+            if not path.is_file() or path.stat().st_size > 512 * 1024:
+                return False
+            payload = json.loads(path.read_text("utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            retention_days = int(payload.get("retention_days") or 0)
+            self.macro_run_history_retention_days = max(
+                1, min(365, retention_days or self.MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT)
+            )
+            cutoff = time.time() - self.macro_run_history_retention_days * 24 * 60 * 60
+            restored = []
+            for raw in payload.get("entries", []) or []:
+                if not isinstance(raw, dict):
+                    continue
+                finished_at = float(raw.get("finished_at") or 0)
+                if not finished_at or finished_at < cutoff:
+                    continue
+                failure_type = str(raw.get("failure_action_type") or "")
+                restored.append({
+                    **self._persistent_macro_history_entry(raw),
+                    "preset_id": str(raw.get("action_preset_id") or ""),
+                    "preset_name": "已脱敏宏",
+                    "source": "上次启动",
+                    "failure_action": (
+                        f"{failure_type}（已记录定位）"
+                        if failure_type else "失败动作（已记录定位）"
+                    ),
+                    "persisted": True,
+                })
+            restored.sort(key=lambda entry: entry["finished_at"], reverse=True)
+            self.macro_run_history = restored[:self.MACRO_RUN_HISTORY_PERSISTENT_LIMIT]
+            if len(restored) != len(payload.get("entries", []) or []):
+                self._save_persistent_macro_run_history()
+            return bool(self.macro_run_history)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def set_macro_run_history_retention_days(self, days):
+        self.macro_run_history_retention_days = max(1, min(365, int(days or 1)))
+        cutoff = time.time() - self.macro_run_history_retention_days * 24 * 60 * 60
+        self.macro_run_history = [
+            entry for entry in getattr(self, "macro_run_history", []) or []
+            if float(entry.get("finished_at") or 0) >= cutoff
+        ]
+        self._save_persistent_macro_run_history()
 
     @staticmethod
     def _macro_finish_summary(task):
@@ -81,10 +204,13 @@ class MacroControlsMixin:
         history.insert(0, entry)
         del history[self.MACRO_RUN_HISTORY_LIMIT:]
         self.macro_run_history = history
+        if status == "失败":
+            self._save_persistent_macro_run_history()
         return entry
 
     def clear_macro_run_history(self):
         self.macro_run_history = []
+        self._save_persistent_macro_run_history()
         dialog = getattr(self, "macro_run_history_dialog", None)
         if dialog is not None:
             dialog.close()
@@ -113,6 +239,26 @@ class MacroControlsMixin:
         dialog.setWindowTitle("宏运行历史")
         dialog.resize(920, 520)
         layout = QVBoxLayout(dialog)
+        persistence_hint = QLabel(
+            "重启后仅保留脱敏失败摘要；可继续定位未变更的动作。"
+        )
+        persistence_hint.setObjectName("muted")
+        layout.addWidget(persistence_hint)
+        retention_row = QHBoxLayout()
+        retention_row.addWidget(QLabel("失败历史保留"))
+        retention = QSpinBox()
+        retention.setRange(1, 365)
+        retention.setSuffix(" 天")
+        retention.setValue(int(getattr(
+            self,
+            "macro_run_history_retention_days",
+            self.MACRO_RUN_HISTORY_RETENTION_DAYS_DEFAULT,
+        )))
+        retention.setToolTip("重启后保留最近失败摘要的天数")
+        retention.valueChanged.connect(self.set_macro_run_history_retention_days)
+        retention_row.addWidget(retention)
+        retention_row.addStretch(1)
+        layout.addLayout(retention_row)
         hint = QTreeWidget()
         hint.setObjectName("macroRunHistory")
         hint.setColumnCount(7)
@@ -193,12 +339,15 @@ class MacroControlsMixin:
         self.macro_run_history_dialog = None
         if pending_location is not None:
             preset_id, action_id = pending_location
-            QTimer.singleShot(
-                0,
-                lambda: self.locate_macro_run_history_action(
-                    preset_id, action_id
-                ),
-            )
+            def locate_after_close():
+                if not self.locate_macro_run_history_action(preset_id, action_id):
+                    QMessageBox.information(
+                        self,
+                        "无法定位动作",
+                        "这条历史记录来自上次启动，或对应方案已变更，"
+                        "因此无法定位到当前动作。",
+                    )
+            QTimer.singleShot(0, locate_after_close)
 
     def _macro_callback_blocked_by_shutdown(self):
         """Keep delayed task callbacks from reopening output during shutdown."""

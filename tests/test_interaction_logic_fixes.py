@@ -1,3 +1,5 @@
+import json
+import tempfile
 import threading
 import time
 import unittest
@@ -303,6 +305,52 @@ class InteractionLogicFixTests(unittest.TestCase):
         self.assertFalse(
             harness.locate_macro_run_history_action("missing", "wait-space")
         )
+
+    def test_failed_macro_history_persists_only_redacted_failure_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            harness = _MacroFinishHarness([])
+            failed = SimpleNamespace(
+                preset={"id": "preset-a", "name": "私人方案"},
+                history_started_at=time.time(), finish_reason="condition_timeout",
+                last_action_context={
+                    "action": "等待条件 Space", "source_preset_id": "child",
+                    "action_id": "wait-space", "action_type": "等待条件",
+                    "call_chain_ids": ["preset-a", "child"],
+                },
+            )
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                harness._record_macro_run_history(failed)
+                payload = json.loads(path.read_text("utf-8"))
+                self.assertEqual(len(payload["entries"]), 1)
+                stored = payload["entries"][0]
+                self.assertNotIn("preset_name", stored)
+                self.assertNotIn("source", stored)
+                self.assertNotIn("failure_action", stored)
+                self.assertEqual(stored["action_id"], "wait-space")
+
+                restored = _MacroFinishHarness([])
+                self.assertTrue(restored.load_persistent_macro_run_history())
+                self.assertEqual(restored.macro_run_history[0]["source"], "上次启动")
+                self.assertEqual(restored.macro_run_history[0]["action_id"], "wait-space")
+
+    def test_persistent_macro_history_drops_entries_past_retention(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            stale = time.time() - 3 * 24 * 60 * 60
+            path.write_text(json.dumps({
+                "version": 1,
+                "retention_days": 1,
+                "entries": [{
+                    "finished_at": stale, "status": "失败",
+                    "detail": "等待条件超时", "duration_ms": 1,
+                    "action_id": "stale-action",
+                }],
+            }), "utf-8")
+            harness = _MacroFinishHarness([])
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                self.assertFalse(harness.load_persistent_macro_run_history())
+                self.assertEqual(harness.macro_run_history, [])
 
     def test_macro_history_location_waits_for_dialog_to_close(self):
         harness = _MacroHistoryDialogHarness()
