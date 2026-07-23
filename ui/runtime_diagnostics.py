@@ -319,11 +319,20 @@ class RuntimeDiagnosticsMixin:
         )
         return True
 
-    def export_failed_run_diagnostic_bundle(self, entry):
-        """Export a redacted bundle scoped to one selected failed run."""
+    def export_failed_run_diagnostic_bundle(self, entry, *, include_logs=True):
+        """Export a locator-only or current-session diagnostic bundle."""
         entry = dict(entry or {})
         if str(entry.get("status") or "") != "失败":
             QMessageBox.information(self, "无法导出", "请选择一条失败的宏运行记录。")
+            return False
+        include_logs = bool(include_logs)
+        if include_logs and entry.get("persisted"):
+            QMessageBox.information(
+                self,
+                "无法导出完整诊断包",
+                "这条记录来自上次启动，原始日志已不可用。"
+                "请导出“失败定位包”。",
+            )
             return False
         blocked, snapshot = operation_blocks(self, "diagnostic_export")
         if blocked:
@@ -331,9 +340,16 @@ class RuntimeDiagnosticsMixin:
                 self, "无法导出诊断包", f"{snapshot.label}，无法开始新的导出。"
             )
             return False
-        suggested = str(Path.home() / "Desktop" / "MacroCanvas-失败诊断包.zip")
+        default_name = (
+            "MacroCanvas-失败诊断包.zip"
+            if include_logs else "MacroCanvas-失败定位包.zip"
+        )
+        suggested = str(Path.home() / "Desktop" / default_name)
         destination, _filter = QFileDialog.getSaveFileName(
-            self, "导出失败诊断包", suggested, "ZIP 压缩包 (*.zip)"
+            self,
+            "导出完整诊断包" if include_logs else "导出失败定位包",
+            suggested,
+            "ZIP 压缩包 (*.zip)",
         )
         if not destination:
             return False
@@ -362,6 +378,7 @@ class RuntimeDiagnosticsMixin:
             "failure_action_type": str(entry.get("failure_action_type") or ""),
             "failure_action_recorded": bool(entry.get("failure_action")),
             "failure_action_location_recorded": bool(entry.get("action_id")),
+            "log_scope": "本次启动" if include_logs else "未包含日志",
         }
         failure_context["action_locator"] = self._failed_run_action_locator(entry)
         health_context = {
@@ -375,7 +392,10 @@ class RuntimeDiagnosticsMixin:
                 active_tasks = len(self.macro_controller.tasks)
             summary = {
                 "application": "MacroCanvas",
-                "bundle_kind": "failed_macro_run",
+                "bundle_kind": (
+                    "failed_macro_run" if include_logs
+                    else "failed_macro_locator"
+                ),
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "python": sys.version.split()[0],
                 "platform": platform.platform(),
@@ -389,9 +409,11 @@ class RuntimeDiagnosticsMixin:
                 summary,
                 self._diagnostic_configuration_summary(),
                 (
-                    ("diagnostic.log", DIAGNOSTIC_LOG_PATH),
-                    ("kanata.log", KANATA_LOG_PATH),
-                    ("kanata-keyboard.log", KANATA_KEYBOARD_LOG_PATH),
+                    (
+                        ("diagnostic.log", DIAGNOSTIC_LOG_PATH),
+                        ("kanata.log", KANATA_LOG_PATH),
+                        ("kanata-keyboard.log", KANATA_KEYBOARD_LOG_PATH),
+                    ) if include_logs else ()
                 ),
                 home=Path.home(),
                 extra_payloads=(("failed-run.json", failure_context),
@@ -403,8 +425,13 @@ class RuntimeDiagnosticsMixin:
         QMessageBox.information(
             self,
             "导出完成",
-            f"失败诊断包已保存：\n{destination}\n\n"
-            f"包含 {len(included)} 份可用日志、失败摘要和方案检查结果；原始配置未写入压缩包。",
+            f"{'完整诊断包' if include_logs else '失败定位包'}已保存：\n{destination}\n\n"
+            + (
+                f"包含 {len(included)} 份本次启动的可用日志、失败摘要和方案检查结果；"
+                "原始配置未写入压缩包。"
+                if include_logs else
+                "包含失败摘要、动作定位和方案检查结果；不包含可能与旧故障无关的日志。"
+            ),
         )
         return True
 

@@ -352,6 +352,23 @@ class InteractionLogicFixTests(unittest.TestCase):
                 self.assertFalse(harness.load_persistent_macro_run_history())
                 self.assertEqual(harness.macro_run_history, [])
 
+    def test_persisted_macro_history_offers_only_locator_export(self):
+        current = {
+            "status": "失败",
+        }
+        persisted = {
+            "status": "失败",
+            "persisted": True,
+        }
+        self.assertEqual(
+            _MacroFinishHarness([]).macro_history_export_options(current),
+            {"locator": True, "full": True},
+        )
+        self.assertEqual(
+            _MacroFinishHarness([]).macro_history_export_options(persisted),
+            {"locator": True, "full": False},
+        )
+
     def test_macro_history_location_waits_for_dialog_to_close(self):
         harness = _MacroHistoryDialogHarness()
 

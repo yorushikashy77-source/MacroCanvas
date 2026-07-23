@@ -232,6 +232,15 @@ class MacroControlsMixin:
         focus = getattr(self, "_focus_submacro_overview_action", None)
         return bool(callable(focus) and focus(card, action_id))
 
+    @staticmethod
+    def macro_history_export_options(entry):
+        """Describe which diagnostic exports are truthful for one record."""
+        failed = isinstance(entry, dict) and entry.get("status") == "失败"
+        return {
+            "locator": bool(failed),
+            "full": bool(failed and not entry.get("persisted")),
+        }
+
     def open_macro_run_history(self):
         dialog = QDialog(self)
         self.macro_run_history_dialog = dialog
@@ -240,7 +249,8 @@ class MacroControlsMixin:
         dialog.resize(920, 520)
         layout = QVBoxLayout(dialog)
         persistence_hint = QLabel(
-            "重启后仅保留脱敏失败摘要；可继续定位未变更的动作。"
+            "重启后仅保留脱敏失败摘要；旧记录可导出定位包，"
+            "完整日志包仅适用于本次启动。"
         )
         persistence_hint.setObjectName("muted")
         layout.addWidget(persistence_hint)
@@ -296,29 +306,38 @@ class MacroControlsMixin:
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         clear = QPushButton("清空")
         clear.setObjectName("dangerGhost")
-        export_failure = QPushButton("导出失败诊断包")
-        export_failure.setObjectName("secondary")
-        export_failure.setEnabled(False)
+        export_locator = QPushButton("导出失败定位包")
+        export_locator.setObjectName("secondary")
+        export_locator.setEnabled(False)
+        export_full = QPushButton("导出完整诊断包")
+        export_full.setObjectName("secondary")
+        export_full.setEnabled(False)
         buttons.addButton(clear, QDialogButtonBox.ButtonRole.ActionRole)
-        buttons.addButton(export_failure, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(export_locator, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(export_full, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(dialog.reject)
         clear.clicked.connect(self.clear_macro_run_history)
 
         def update_export_state(current, _previous=None):
             entry = current.data(6, 32) if current is not None else None
-            export_failure.setEnabled(
-                isinstance(entry, dict) and entry.get("status") == "失败"
-            )
+            options = self.macro_history_export_options(entry)
+            export_locator.setEnabled(options["locator"])
+            export_full.setEnabled(options["full"])
 
-        def export_selected_failure():
+        def export_selected_failure(include_logs):
             row = hint.currentItem()
             entry = row.data(6, 32) if row is not None else None
             exporter = getattr(self, "export_failed_run_diagnostic_bundle", None)
             if isinstance(entry, dict) and callable(exporter):
-                exporter(entry)
+                exporter(entry, include_logs=include_logs)
 
         hint.currentItemChanged.connect(update_export_state)
-        export_failure.clicked.connect(export_selected_failure)
+        export_locator.clicked.connect(
+            lambda: export_selected_failure(include_logs=False)
+        )
+        export_full.clicked.connect(
+            lambda: export_selected_failure(include_logs=True)
+        )
 
         def locate_selected(*_args):
             nonlocal pending_location
