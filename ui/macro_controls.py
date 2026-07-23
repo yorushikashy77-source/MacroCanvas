@@ -221,6 +221,20 @@ class MacroControlsMixin:
         if dialog is not None:
             dialog.close()
 
+    def clear_macro_run_history_with_confirmation(self, parent=None):
+        """Clear every history entry only after an explicit confirmation."""
+        answer = QMessageBox.question(
+            parent,
+            "清空全部历史",
+            "清空本次运行记录和已保存的失败历史？此操作无法撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.clear_macro_run_history()
+        return True
+
     @staticmethod
     def macro_history_entry_matches_filter(entry, status="全部", scope="全部"):
         """Return whether one history entry belongs in the selected view."""
@@ -371,7 +385,9 @@ class MacroControlsMixin:
         buttons.addButton(export_locator, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.addButton(export_full, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(dialog.reject)
-        clear.clicked.connect(self.clear_macro_run_history)
+        clear.clicked.connect(
+            lambda: self.clear_macro_run_history_with_confirmation(dialog)
+        )
 
         def selected_history_entry(row):
             token = row.data(6, 32) if row is not None else ""

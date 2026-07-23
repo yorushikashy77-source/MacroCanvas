@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QTreeWidget, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QTreeWidget, QWidget
 
 from core.constants import ConfigState, MacroState
 from ui.macro_controls import MacroControlsMixin
@@ -465,6 +465,30 @@ class InteractionLogicFixTests(unittest.TestCase):
                 self.assertFalse(harness.delete_macro_run_history_entry(
                     "not-a-history-entry"
                 ))
+
+    def test_clear_macro_history_requires_confirmation(self):
+        entry = {"status": "失败", "finished_at": time.time()}
+        harness = _MacroFinishHarness([])
+        harness.macro_run_history = [entry]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                with patch(
+                    "ui.macro_controls.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.No,
+                ):
+                    self.assertFalse(
+                        harness.clear_macro_run_history_with_confirmation()
+                    )
+                self.assertEqual(harness.macro_run_history, [entry])
+                with patch(
+                    "ui.macro_controls.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ):
+                    self.assertTrue(
+                        harness.clear_macro_run_history_with_confirmation()
+                    )
+                self.assertEqual(harness.macro_run_history, [])
 
     def test_macro_history_location_waits_for_dialog_to_close(self):
         harness = _MacroHistoryDialogHarness()
