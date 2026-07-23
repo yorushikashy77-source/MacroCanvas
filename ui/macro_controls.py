@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QHeaderView, QHBoxLayout, QLabel,
+    QComboBox, QDialog, QDialogButtonBox, QHeaderView, QHBoxLayout, QLabel,
     QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout,
 )
@@ -215,6 +215,58 @@ class MacroControlsMixin:
         if dialog is not None:
             dialog.close()
 
+    @staticmethod
+    def macro_history_entry_matches_filter(entry, status="全部", scope="全部"):
+        """Return whether one history entry belongs in the selected view."""
+        if not isinstance(entry, dict):
+            return False
+        if status != "全部" and str(entry.get("status") or "") != status:
+            return False
+        if scope == "本次启动" and entry.get("persisted"):
+            return False
+        if scope == "上次启动" and not entry.get("persisted"):
+            return False
+        return True
+
+    def filtered_macro_run_history(self, status="全部", scope="全部"):
+        """Keep the filter logic usable without depending on the dialog."""
+        return [
+            entry for entry in getattr(self, "macro_run_history", []) or []
+            if self.macro_history_entry_matches_filter(entry, status, scope)
+        ]
+
+    @staticmethod
+    def _macro_history_entry_token(entry):
+        """Return an in-memory token safe to pass through Qt item data."""
+        return f"{id(entry):x}" if isinstance(entry, dict) else ""
+
+    def _macro_history_entry_from_token(self, token):
+        token = str(token or "")
+        return next(
+            (
+                candidate
+                for candidate in getattr(self, "macro_run_history", []) or []
+                if self._macro_history_entry_token(candidate) == token
+            ),
+            None,
+        )
+
+    def delete_macro_run_history_entry(self, entry):
+        """Delete one selected record and synchronise its saved failure copy."""
+        history = list(getattr(self, "macro_run_history", []) or [])
+        token = (
+            str(entry or "")
+            if isinstance(entry, str)
+            else self._macro_history_entry_token(entry)
+        )
+        for index, candidate in enumerate(history):
+            if candidate is entry or self._macro_history_entry_token(candidate) == token:
+                del history[index]
+                self.macro_run_history = history
+                self._save_persistent_macro_run_history()
+                return True
+        return False
+
     def locate_macro_run_history_action(self, preset_id, action_id=""):
         """Open a recorded failure's editor and visibly select its action."""
         preset_id = str(preset_id or "")
@@ -269,6 +321,18 @@ class MacroControlsMixin:
         retention_row.addWidget(retention)
         retention_row.addStretch(1)
         layout.addLayout(retention_row)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("显示"))
+        status_filter = QComboBox()
+        status_filter.addItems(["全部", "失败", "完成", "已停止"])
+        status_filter.setToolTip("按运行结果筛选")
+        filter_row.addWidget(status_filter)
+        scope_filter = QComboBox()
+        scope_filter.addItems(["全部", "本次启动", "上次启动"])
+        scope_filter.setToolTip("区分本次启动和重启后恢复的失败摘要")
+        filter_row.addWidget(scope_filter)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
         hint = QTreeWidget()
         hint.setObjectName("macroRunHistory")
         hint.setColumnCount(7)
@@ -283,29 +347,13 @@ class MacroControlsMixin:
         hint.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         hint.header().setSectionResizeMode(5, QHeaderView.Stretch)
         hint.header().setSectionResizeMode(6, QHeaderView.Stretch)
-        history = list(getattr(self, "macro_run_history", []) or [])
-        for entry in history:
-            timestamp = datetime.fromtimestamp(entry["finished_at"]).strftime(
-                "%H:%M:%S"
-            )
-            row = QTreeWidgetItem([
-                timestamp, entry["preset_name"], entry["source"],
-                entry["status"], f"{entry['duration_ms']} ms",
-                entry.get("failure_action", "—") or "—", entry["detail"],
-            ])
-            row.setData(0, 32, entry.get("action_preset_id") or entry["preset_id"])
-            row.setData(1, 32, entry.get("action_id", ""))
-            row.setData(6, 32, entry)
-            hint.addTopLevelItem(row)
-        if not history:
-            hint.addTopLevelItem(QTreeWidgetItem([
-                "—", "—", "—", "暂无记录", "—", "—",
-                "本次启动后完成的宏会显示在这里。",
-            ]))
         layout.addWidget(hint, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         clear = QPushButton("清空")
         clear.setObjectName("dangerGhost")
+        delete_selected = QPushButton("删除选中")
+        delete_selected.setObjectName("dangerGhost")
+        delete_selected.setEnabled(False)
         export_locator = QPushButton("导出失败定位包")
         export_locator.setObjectName("secondary")
         export_locator.setEnabled(False)
@@ -313,31 +361,89 @@ class MacroControlsMixin:
         export_full.setObjectName("secondary")
         export_full.setEnabled(False)
         buttons.addButton(clear, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.addButton(delete_selected, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.addButton(export_locator, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.addButton(export_full, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.rejected.connect(dialog.reject)
         clear.clicked.connect(self.clear_macro_run_history)
 
-        def update_export_state(current, _previous=None):
-            entry = current.data(6, 32) if current is not None else None
+        def selected_history_entry(row):
+            token = row.data(6, 32) if row is not None else ""
+            return self._macro_history_entry_from_token(token)
+
+        def update_action_state(current, _previous=None):
+            entry = selected_history_entry(current)
             options = self.macro_history_export_options(entry)
+            delete_selected.setEnabled(isinstance(entry, dict))
             export_locator.setEnabled(options["locator"])
             export_full.setEnabled(options["full"])
 
+        def rebuild_history(*_args):
+            status = status_filter.currentText()
+            scope = scope_filter.currentText()
+            history = self.filtered_macro_run_history(status, scope)
+            hint.clear()
+            for entry in history:
+                timestamp = datetime.fromtimestamp(
+                    entry["finished_at"]
+                ).strftime("%H:%M:%S")
+                row = QTreeWidgetItem([
+                    timestamp, entry["preset_name"], entry["source"],
+                    entry["status"], f"{entry['duration_ms']} ms",
+                    entry.get("failure_action", "—") or "—", entry["detail"],
+                ])
+                row.setData(
+                    0, 32, entry.get("action_preset_id") or entry["preset_id"]
+                )
+                row.setData(1, 32, entry.get("action_id", ""))
+                row.setData(6, 32, self._macro_history_entry_token(entry))
+                hint.addTopLevelItem(row)
+            if not history:
+                message = (
+                    "本次启动后完成的宏会显示在这里。"
+                    if status == "全部" and scope == "全部"
+                    else "没有符合当前筛选条件的记录。"
+                )
+                hint.addTopLevelItem(QTreeWidgetItem([
+                    "—", "—", "—", "暂无记录", "—", "—", message,
+                ]))
+            update_action_state(hint.currentItem())
+
         def export_selected_failure(include_logs):
             row = hint.currentItem()
-            entry = row.data(6, 32) if row is not None else None
+            entry = selected_history_entry(row)
             exporter = getattr(self, "export_failed_run_diagnostic_bundle", None)
             if isinstance(entry, dict) and callable(exporter):
                 exporter(entry, include_logs=include_logs)
 
-        hint.currentItemChanged.connect(update_export_state)
+        def delete_selected_entry():
+            row = hint.currentItem()
+            entry = selected_history_entry(row)
+            if not isinstance(entry, dict):
+                return
+            answer = QMessageBox.question(
+                dialog,
+                "删除历史记录",
+                "删除选中的宏运行记录？此操作无法撤销。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.delete_macro_run_history_entry(entry)
+                rebuild_history()
+
+        hint.currentItemChanged.connect(update_action_state)
+        status_filter.currentTextChanged.connect(rebuild_history)
+        scope_filter.currentTextChanged.connect(rebuild_history)
+        retention.valueChanged.connect(rebuild_history)
+        delete_selected.clicked.connect(delete_selected_entry)
         export_locator.clicked.connect(
             lambda: export_selected_failure(include_logs=False)
         )
         export_full.clicked.connect(
             lambda: export_selected_failure(include_logs=True)
         )
+        rebuild_history()
 
         def locate_selected(*_args):
             nonlocal pending_location

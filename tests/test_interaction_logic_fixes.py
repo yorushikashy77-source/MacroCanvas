@@ -369,6 +369,61 @@ class InteractionLogicFixTests(unittest.TestCase):
             {"locator": True, "full": False},
         )
 
+    def test_macro_history_filters_and_deletes_one_record(self):
+        finished_at = time.time()
+        current_failure = {
+            "status": "失败", "preset_name": "当前方案",
+            "finished_at": finished_at, "duration_ms": 1,
+        }
+        current_success = {
+            "status": "完成", "preset_name": "当前方案",
+            "finished_at": finished_at, "duration_ms": 1,
+        }
+        persisted_failure = {
+            "status": "失败", "preset_name": "已脱敏宏", "persisted": True,
+            "finished_at": finished_at, "duration_ms": 1,
+        }
+        harness = _MacroFinishHarness([])
+        harness.macro_run_history = [
+            current_failure, current_success, persisted_failure,
+        ]
+
+        self.assertEqual(
+            harness.filtered_macro_run_history("失败", "全部"),
+            [current_failure, persisted_failure],
+        )
+        self.assertEqual(
+            harness.filtered_macro_run_history("全部", "本次启动"),
+            [current_failure, current_success],
+        )
+        self.assertEqual(
+            harness.filtered_macro_run_history("失败", "上次启动"),
+            [persisted_failure],
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                token = harness._macro_history_entry_token(current_success)
+                self.assertIs(
+                    harness._macro_history_entry_from_token(token),
+                    current_success,
+                )
+                self.assertTrue(harness.delete_macro_run_history_entry(
+                    token
+                ))
+                self.assertEqual(
+                    harness.macro_run_history,
+                    [current_failure, persisted_failure],
+                )
+                stored = json.loads(path.read_text("utf-8"))["entries"]
+                self.assertEqual(len(stored), 2)
+                self.assertTrue(all(
+                    entry["status"] == "失败" for entry in stored
+                ))
+                self.assertFalse(harness.delete_macro_run_history_entry(
+                    "not-a-history-entry"
+                ))
+
     def test_macro_history_location_waits_for_dialog_to_close(self):
         harness = _MacroHistoryDialogHarness()
 
