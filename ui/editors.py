@@ -1,5 +1,6 @@
 import weakref
 
+from shiboken6 import isValid
 from PySide6.QtCore import QEvent, QItemSelectionModel, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QCursor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -1302,8 +1303,13 @@ class ActionTreeWidget(QTreeWidget):
         super().keyPressEvent(event)
 
     def _refresh_overlay(self):
+        # A zero-delay refresh can remain queued while an action dialog closes.
+        # Qt destroys the native tree first, but its Python wrapper may still
+        # receive the callback during event-loop cleanup.
+        if not isValid(self):
+            return
         overlay = getattr(self, "_overlay", None)
-        if overlay is None:
+        if overlay is None or not isValid(overlay):
             return
         overlay.setGeometry(self.viewport().rect())
         overlay.raise_()

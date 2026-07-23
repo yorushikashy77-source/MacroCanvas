@@ -7,7 +7,7 @@ if not hasattr(ctypes, "WINFUNCTYPE"):
     ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
 
 try:
-    from PySide6.QtCore import QPoint, QPointF, QSize, Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QSize, Qt
     from PySide6.QtGui import QWheelEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QComboBox, QTreeWidgetItem
@@ -114,6 +114,15 @@ class ActionMenuDragInteraction68QtTests(unittest.TestCase):
         self.assertEqual(tree.selectedItems(), [tree.topLevelItem(5)])
         self.assertIs(tree.currentItem(), tree.topLevelItem(5))
         QTest.keyClick(combos[-1], Qt.Key.Key_Escape)
+
+    def test_queued_overlay_refresh_ignores_a_deleted_tree(self):
+        tree = ActionTreeWidget()
+        tree.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+        # This mirrors a queued zero-delay callback that reaches the Python
+        # wrapper after Qt has already deleted the native action tree.
+        tree._refresh_overlay()
 
 
 if __name__ == "__main__":
