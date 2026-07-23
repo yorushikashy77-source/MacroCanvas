@@ -352,6 +352,48 @@ class InteractionLogicFixTests(unittest.TestCase):
                 self.assertFalse(harness.load_persistent_macro_run_history())
                 self.assertEqual(harness.macro_run_history, [])
 
+    def test_history_retention_keeps_current_session_records(self):
+        stale = time.time() - 3 * 24 * 60 * 60
+        current = {
+            "finished_at": stale, "status": "完成", "persisted": False,
+        }
+        restored = {
+            "finished_at": stale, "status": "失败", "persisted": True,
+        }
+        harness = _MacroFinishHarness([])
+        harness.macro_run_history = [current, restored]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                harness.set_macro_run_history_retention_days(1)
+                self.assertEqual(harness.macro_run_history, [current])
+                self.assertEqual(
+                    json.loads(path.read_text("utf-8"))["entries"], []
+                )
+
+    def test_persistent_macro_history_load_prunes_file_to_limit(self):
+        now = time.time()
+        entries = [{
+            "finished_at": now - index,
+            "status": "失败",
+            "detail": "等待条件超时",
+            "duration_ms": 1,
+            "action_id": f"action-{index}",
+        } for index in range(52)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "macro-run-history.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "retention_days": 30,
+                "entries": entries,
+            }), "utf-8")
+            harness = _MacroFinishHarness([])
+            with patch("ui.macro_controls.MACRO_RUN_HISTORY_PATH", path):
+                self.assertTrue(harness.load_persistent_macro_run_history())
+                self.assertEqual(len(harness.macro_run_history), 50)
+                stored = json.loads(path.read_text("utf-8"))["entries"]
+                self.assertEqual(len(stored), 50)
+
     def test_persisted_macro_history_offers_only_locator_export(self):
         current = {
             "status": "失败",

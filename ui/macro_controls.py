@@ -129,7 +129,10 @@ class MacroControlsMixin:
                 })
             restored.sort(key=lambda entry: entry["finished_at"], reverse=True)
             self.macro_run_history = restored[:self.MACRO_RUN_HISTORY_PERSISTENT_LIMIT]
-            if len(restored) != len(payload.get("entries", []) or []):
+            if (
+                len(restored) != len(payload.get("entries", []) or [])
+                or len(restored) > self.MACRO_RUN_HISTORY_PERSISTENT_LIMIT
+            ):
                 self._save_persistent_macro_run_history()
             return bool(self.macro_run_history)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -140,7 +143,10 @@ class MacroControlsMixin:
         cutoff = time.time() - self.macro_run_history_retention_days * 24 * 60 * 60
         self.macro_run_history = [
             entry for entry in getattr(self, "macro_run_history", []) or []
-            if float(entry.get("finished_at") or 0) >= cutoff
+            if (
+                not entry.get("persisted")
+                or float(entry.get("finished_at") or 0) >= cutoff
+            )
         ]
         self._save_persistent_macro_run_history()
 
@@ -349,7 +355,7 @@ class MacroControlsMixin:
         hint.header().setSectionResizeMode(6, QHeaderView.Stretch)
         layout.addWidget(hint, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        clear = QPushButton("清空")
+        clear = QPushButton("清空全部")
         clear.setObjectName("dangerGhost")
         delete_selected = QPushButton("删除选中")
         delete_selected.setObjectName("dangerGhost")
