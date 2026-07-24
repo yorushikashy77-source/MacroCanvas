@@ -156,6 +156,72 @@ class BackupDiffUiTests(unittest.TestCase):
         self.assertEqual(results[0]["error"], "")
         self.assertEqual(results[0]["diff"]["changed_sections"], ["preferences"])
 
+    def test_snapshot_loader_preserves_variables_submacro_and_loop_refs(self):
+        current = sample_config()
+        backup = json.loads(json.dumps(current))
+        backup["presets"] = [
+            {
+                "id": "root", "enabled": False, "name": "调用方",
+                "trigger_modifiers": "无", "trigger": "F2",
+                "execution_mode": "执行一次",
+                "actions": [
+                    {
+                        "type": "调用子宏", "action_id": "call-child",
+                        "preset_id": "child", "repeat_count": 1,
+                        "speed_percent": 100,
+                        "parameter_values": {"技能键": "B"},
+                    },
+                    {
+                        "type": "循环动作", "id": "loop-child",
+                        "target_action_ids": ["call-child"],
+                        "loop_count": 2, "loop_interval_ms": 50,
+                        "speed_percent": 100,
+                    },
+                ],
+            },
+            {
+                "id": "child", "enabled": False, "name": "被调用方",
+                "trigger_modifiers": "无", "trigger": "F3",
+                "execution_mode": "执行一次",
+                "parameters": [
+                    {"name": "技能键", "type": "按键", "default": "A"},
+                ],
+                "actions": [
+                    {
+                        "type": "键盘点击", "action_id": "child-key",
+                        "target": "A", "hold_ms": 10,
+                        "parameter_bindings": {"target": "技能键"},
+                    },
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "saved-parameterized.json"
+            path.write_text(json.dumps(backup, ensure_ascii=False), "utf-8")
+            results = []
+            task = _SnapshotLoadTask(path, current)
+            task.signals.finished.connect(results.append)
+            task.run()
+
+        self.assertEqual(results[0]["error"], "")
+        loaded = {item["id"]: item for item in results[0]["payload"]["presets"]}
+        self.assertEqual(
+            loaded["child"]["parameters"],
+            [{"name": "技能键", "type": "按键", "default": "A"}],
+        )
+        self.assertEqual(
+            loaded["child"]["actions"][0]["parameter_bindings"],
+            {"target": "技能键"},
+        )
+        self.assertEqual(
+            loaded["root"]["actions"][0]["parameter_values"],
+            {"技能键": "B"},
+        )
+        self.assertEqual(
+            loaded["root"]["actions"][1]["target_action_ids"],
+            ["call-child"],
+        )
+
     def test_diff_checkboxes_control_restore_button_and_selection(self):
         with tempfile.TemporaryDirectory() as folder:
             dialog = BackupManagerDialog(folder, current_payload=sample_config())
